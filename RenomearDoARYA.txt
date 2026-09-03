@@ -1,0 +1,5 @@
+for f in `ls *`; 
+do 
+i=`echo $f | cut -c4-7`
+echo mv $f CTI.0000000.000000.$i.DRI; 
+done
