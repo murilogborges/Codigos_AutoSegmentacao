@@ -1,11 +1,11 @@
-DICOMFolder="/home/borges/META01/"
+DICOMFolder="/home/borges/META03/"
 
 ## META
 TotalSegmentator -i $DICOMFolder -o $DICOMFolder/TOTAL_META -ta total -ot dicom_rtstruct -ho -bs 
 TotalSegmentator -i $DICOMFolder -o $DICOMFolder/BODY -ta body -ot dicom_rtstruct -ho -bs
 TotalSegmentator -i $DICOMFolder -o $DICOMFolder/TISSUE -ta tissue_4_types -ot dicom_rtstruct -ho -bs
 
-python IHaveABody.py $DICOMFolder/BODY.dcm "#55ffff"
+python /home/borges/Codigos_AutoSegmentacao/IHaveABody.py $DICOMFolder/BODY.dcm "#55ffff"
 
 python unir_rtstructs.py -o $DICOMFolder/TOTAL_META.dcm $DICOMFolder/CORPO.dcm $DICOMFolder/TISSUE.dcm
 
