@@ -12,4 +12,4 @@ python BreastSplit.py $DICOMFolder $DICOMFolder/BREASTS.dcm
 python NothingBreaksLikeAHeart.py $DICOMFolder/HEART.dcm $DICOMFolder
 python IHaveABody.py $DICOMFolder/BODY.dcm "#55ffff"
 
-python unir_rtstructs.py -o $DICOMFolder/GrupoMama.dcm  $DICOMFolder/Cardiac_area.dcm $DICOMFolder/BREASTS_separado.dcm $DICOMFolder/TOTAL_MAMA.dcm $DICOMFolder/CORO.dcm $DICOMFolder/CORPO.dcm #$DICOMFolder/TISSUE.dcm
+python unir_rtstructs_MAMA.py -o $DICOMFolder/GrupoMama.dcm  $DICOMFolder/Cardiac_area.dcm $DICOMFolder/BREASTS_separado.dcm $DICOMFolder/TOTAL_MAMA.dcm $DICOMFolder/CORO.dcm $DICOMFolder/CORPO.dcm #$DICOMFolder/TISSUE.dcm

@@ -30,86 +30,402 @@ MAX_NAME_LEN = 15
 RTSTRUCT_SOPCLASS = "1.2.840.10008.5.1.4.1.1.481.3"  # RT Structure Set Storage
 
 TRADUCAO = {
-    "breast": "mama",
-    "breast_right": "mama_D",
-    "breast_left": "mama_E",
-    "heart_myocardium": "miocardio",
-    "heart_atrium_left": "atri_E",
-    "heart_ventricle_left": "ventri_E",
-    "heart_atrium_right": "atri_D",
-    "heart_ventricle_right": "ventri_D",
-    "aorta": "aorta",
-    "pulmonary_artery": "art_pulm",
-    "cardiac_area": "area_card",
-    "coronary_arteries": "art_coron",
-    "corpo": "corpo",
-    "subcutaneous_fat": "gord_subcut",
-    "torso_fat": "gord_torax",
-    "skeletal_muscle": "musculo",
-    "intermuscular_fat": "gord_inter",
-    "spleen": "baco",
-    "gallbladder": "vesicula",
-    "liver": "figado",
-    "stomach": "estomago",
-    "pancreas": "pancreas",
-    "lung_upper_lobe_left": "pulmao_sup_E",
-    "lung_lower_lobe_left": "pulmao_inf_E",
-    "lung_upper_lobe_right": "pulmao_sup_D",
-    "lung_middle_lobe_right": "pulmao_med_D",
-    "lung_lower_lobe_right": "pulmao_inf_D",
-    "esophagus": "esofago",
-    "trachea": "traqueia",
-    "thyroid_gland": "tireoide",
-    "duodenum": "duodeno",
-    "vertebrae_l2": "vertebra_L2",
-    "vertebrae_l1": "vertebra_L1",
-    "vertebrae_t11": "vertebra_T11",
-    "vertebrae_t10": "vertebra_T10",
-    "vertebrae_t9": "vertebra_T9",
-    "vertebrae_t8": "vertebra_T8",
-    "vertebrae_t7": "vertebra_T7",
-    "vertebrae_t6": "vertebra_T6",
-    "vertebrae_t5": "vertebra_T5",
-    "vertebrae_t4": "vertebra_T4",
-    "vertebrae_t3": "vertebra_T3",
-    "vertebrae_t2": "vertebra_T2",
-    "vertebrae_t1": "vertebra_T1",
-    "vertebrae_c7": "vertebra_C7",
-    "vertebrae_c6": "vertebra_C6",
-    "vertebrae_c5": "vertebra_C5",
-    "vertebrae_c4": "vertebra_C4",
-    "vertebrae_c3": "vertebra_C3",
-    "vertebrae_c2": "vertebra_C2",
-    "vertebrae_c1": "vertebra_C1",
-    "humerus_left": "umero_E",
-    "humerus_right": "umero_D",
-    "spinal_cord": "medula",
-    "rib_left_1": "costela_E1",
-    "rib_left_2": "costela_E2",
-    "rib_left_3": "costela_E3",
-    "rib_left_4": "costela_E4",
-    "rib_left_5": "costela_E5",
-    "rib_left_6": "costela_E6",
-    "rib_left_7": "costela_E7",
-    "rib_left_8": "costela_E8",
-    "rib_left_9": "costela_E9",
-    "rib_left_10": "costela_E10",
-    "rib_left_11": "costela_E11",
-    "rib_left_12": "costela_E12",
-    "rib_right_1": "costela_D1",
-    "rib_right_2": "costela_D2",
-    "rib_right_3": "costela_D3",
-    "rib_right_4": "costela_D4",
-    "rib_right_5": "costela_D5",
-    "rib_right_6": "costela_D6",
-    "rib_right_7": "costela_D7",
-    "rib_right_8": "costela_D8",
-    "rib_right_9": "costela_D9",
-    "rib_right_10": "costela_D10",
-    "rib_right_11": "costela_D11",
-    "rib_right_12": "costela_D12",
-    "sternum": "esterno",
-    "costal_cartilages": "cartil_cost"
+
+# órgãos
+"spleen":"baco",
+"kidney_right":"rim_D",
+"kidney_left":"rim_E",
+"gallbladder":"vesicula",
+"liver":"figado",
+"stomach":"estomago",
+"pancreas":"pancreas",
+
+# adrenais
+"adrenal_gland_right":"supra_D",
+"adrenal_gland_left":"supra_E",
+
+# pulmões
+"lung_left":"pulmao_E",
+"lung_right":"pulmao_D",
+"lung":"pulmao",
+
+"lung_upper_lobe_left":"pulmao_sup_E",
+"lung_lower_lobe_left":"pulmao_inf_E",
+
+"lung_upper_lobe_right":"pulmao_sup_D",
+"lung_middle_lobe_right":"pulmao_med_D",
+"lung_lower_lobe_right":"pulmao_inf_D",
+
+# digestivo
+"small_bowel":"int_delgado",
+"duodenum":"duodeno",
+"colon":"colon",
+
+# urinário
+"urinary_bladder":"bexiga",
+"prostate":"prostata",
+
+"kidney_cyst_left":"cisto_rim_E",
+"kidney_cyst_right":"cisto_rim_D",
+
+# coração
+"heart":"coracao",
+"heart_myocardium":"miocardio",
+"heart_atrium_left":"atri_E",
+"heart_atrium_right":"atri_D",
+"heart_ventricle_left":"ventri_E",
+"heart_ventricle_right":"ventri_D",
+
+# vasos
+"aorta":"aorta",
+"pulmonary_artery":"art_pulm",
+"pulmonary_vein":"veia_pulm",
+
+"superior_vena_cava":"vc_sup",
+"inferior_vena_cava":"vc_inf",
+
+"portal_vein_and_splenic_vein":"v_portoespl",
+
+"iliac_artery_left":"art_ilia_E",
+"iliac_artery_right":"art_ilia_D",
+
+"iliac_vena_left":"v_ilia_E",
+"iliac_vena_right":"v_ilia_D",
+
+"brachiocephalic_trunk":"tronco_brac",
+
+"subclavian_artery_left":"subclav_E",
+"subclavian_artery_right":"subclav_D",
+
+"common_carotid_artery_left":"carot_com_E",
+"common_carotid_artery_right":"carot_com_D",
+
+"brachiocephalic_vein_left":"v_brac_E",
+"brachiocephalic_vein_right":"v_brac_D",
+
+"atrial_appendage_left":"auric_E",
+
+# SNC
+"brain":"cerebro",
+"brainstem":"tronco_enc",
+"skull":"cranio",
+
+# vias aéreas
+"trachea":"traqueia",
+"esophagus":"esofago",
+"thyroid_gland":"tireoide",
+
+# ossos
+"humerus_left":"umero_E",
+"humerus_right":"umero_D",
+
+"scapula_left":"escapula_E",
+"scapula_right":"escapula_D",
+
+"clavicula_left":"clavicula_E",
+"clavicula_right":"clavicula_D",
+
+"femur_left":"femur_E",
+"femur_right":"femur_D",
+
+"hip_left":"quadril_E",
+"hip_right":"quadril_D",
+
+"sacrum":"sacro",
+
+# medula
+"spinal_cord":"medula",
+
+# glúteos
+"gluteus_maximus_left":"glutmax_E",
+"gluteus_maximus_right":"glutmax_D",
+
+"gluteus_medius_left":"glutmed_E",
+"gluteus_medius_right":"glutmed_D",
+
+"gluteus_minimus_left":"glutmin_E",
+"gluteus_minimus_right":"glutmin_D",
+
+# músculos
+"autochthon_left":"autoct_E",
+"autochthon_right":"autoct_D",
+
+"iliopsoas_left":"iliopsoas_E",
+"iliopsoas_right":"iliopsoas_D",
+
+# costelas e cartilagens
+"sternum":"esterno",
+"costal_cartilages":"cartil_cost",
+
+# pulmão vasos
+"lung_airways":"vias_aereas",
+"lung_airways_wall":"parede_va",
+"lung_arteries":"art_pulmres",
+"lung_veins":"veias_pulm",
+"lung_vessels":"vasos_pulm",
+"lung_trachea_bronchia":"traq_bronq",
+
+# covid
+"lung_covid_infiltrate":"infl_covid",
+
+# hemorragia
+"intracerebral_hemorrhage":"hem_cereb",
+
+# implantes
+"hip_implant":"imp_quadril",
+
+# coronárias
+"coronary_arteries":"art_coron",
+
+# corpo
+"body_trunc":"corpo_tronco",
+"body_extremities":"extremid",
+
+# tecidos
+"subcutaneous_fat":"gord_subcut",
+"torso_fat":"gord_torax",
+"skeletal_muscle":"musculo",
+"intermuscular_fat":"gord_inter",
+
+# pleura
+"lung_pleural":"pleura",
+"pleural_effusion":"derr_pleura",
+"pericardial_effusion":"derr_peric",
+
+# fígado
+"liver_vessels":"vasos_fig",
+"liver_tumor":"tumor_fig",
+
+"liver_segment_1":"seg_fig_1",
+"liver_segment_2":"seg_fig_2",
+"liver_segment_3":"seg_fig_3",
+"liver_segment_4":"seg_fig_4",
+"liver_segment_5":"seg_fig_5",
+"liver_segment_6":"seg_fig_6",
+"liver_segment_7":"seg_fig_7",
+"liver_segment_8":"seg_fig_8",
+
+"liver_lesions":"lesoes_fig",
+
+# vértebras especiais
+"vertebrae":"vertebras",
+"vertebrae_body":"corpo_vert",
+"intervertebral_discs":"disc_iv",
+
+"vertebrae_s1":"vertebra_S1",
+"vertebrae_l1":"vertebra_L1",
+"vertebrae_l2":"vertebra_L2",
+"vertebrae_l3":"vertebra_L3",
+"vertebrae_l4":"vertebra_L4",
+"vertebrae_l5":"vertebra_L5",
+"vertebrae_l6":"vertebra_L6",
+
+"vertebrae_t1":"vertebra_T1",
+"vertebrae_t2":"vertebra_T2",
+"vertebrae_t3":"vertebra_T3",
+"vertebrae_t4":"vertebra_T4",
+"vertebrae_t5":"vertebra_T5",
+"vertebrae_t6":"vertebra_T6",
+"vertebrae_t7":"vertebra_T7",
+"vertebrae_t8":"vertebra_T8",
+"vertebrae_t9":"vertebra_T9",
+"vertebrae_t10":"vertebra_T10",
+"vertebrae_t11":"vertebra_T11",
+"vertebrae_t12":"vertebra_T12",
+
+"vertebrae_c1":"vertebra_C1",
+"vertebrae_c2":"vertebra_C2",
+"vertebrae_c3":"vertebra_C3",
+"vertebrae_c4":"vertebra_C4",
+"vertebrae_c5":"vertebra_C5",
+"vertebrae_c6":"vertebra_C6",
+"vertebrae_c7":"vertebra_C7",
+
+# olhos
+"eye_left":"olho_E",
+"eye_right":"olho_D",
+
+"eye_lens_left":"cristal_E",
+"eye_lens_right":"cristal_D",
+
+"optic_nerve_left":"nervo_opt_E",
+"optic_nerve_right":"nervo_opt_D",
+
+# glândulas
+"parotid_gland_left":"parotida_E",
+"parotid_gland_right":"parotida_D",
+
+"submandibular_gland_left":"submand_E",
+"submandibular_gland_right":"submand_D",
+
+# faringe
+"nasopharynx":"nasofaringe",
+"oropharynx":"orofaringe",
+"hypopharynx":"hipofaringe",
+
+# cavidades nasais
+"nasal_cavity_left":"cav_nasal_E",
+"nasal_cavity_right":"cav_nasal_D",
+
+# ouvido
+"auditory_canal_left":"can_aud_E",
+"auditory_canal_right":"can_aud_D",
+
+# palato
+"soft_palate":"palato_mol",
+"hard_palate":"palato_dur",
+
+# laringe
+"larynx_air":"laringe_ar",
+"thyroid_cartilage":"cart_tireo",
+"hyoid":"hioide",
+"cricoid_cartilage":"cart_crico",
+
+# zigoma
+"zygomatic_arch_left":"zigoma_E",
+"zygomatic_arch_right":"zigoma_D",
+
+# estiloide
+"styloid_process_left":"estiloide_E",
+"styloid_process_right":"estiloide_D",
+
+# carótidas
+"internal_carotid_artery_left":"carot_int_E",
+"internal_carotid_artery_right":"carot_int_D",
+
+# jugulares
+"internal_jugular_vein_left":"jugular_E",
+"internal_jugular_vein_right":"jugular_D",
+
+# mastigação
+"masseter_left":"masseter_E",
+"masseter_right":"masseter_D",
+
+"temporalis_left":"temporal_E",
+"temporalis_right":"temporal_D",
+
+"lateral_pterygoid_left":"pterig_lat_E",
+"lateral_pterygoid_right":"pterig_lat_D",
+
+"medial_pterygoid_left":"pterig_med_E",
+"medial_pterygoid_right":"pterig_med_D",
+
+"tongue":"lingua",
+
+"digastric_left":"digastr_E",
+"digastric_right":"digastr_D",
+
+# pescoço
+"sternocleidomastoid_left":"ecm_E",
+"sternocleidomastoid_right":"ecm_D",
+
+"superior_pharyngeal_constrictor":"const_far_sup",
+"middle_pharyngeal_constrictor":"const_far_med",
+"inferior_pharyngeal_constrictor":"const_far_inf",
+
+"trapezius":"trapezio",
+"trapezius_left":"trap_E",
+"trapezius_right":"trap_D",
+
+"platysma_left":"platisma_E",
+"platysma_right":"platisma_D",
+
+"levator_scapulae_left":"lev_esc_E",
+"levator_scapulae_right":"lev_esc_D",
+
+"anterior_scalene_left":"escal_ant_E",
+"anterior_scalene_right":"escal_ant_D",
+
+"middle_scalene_left":"escal_med_E",
+"middle_scalene_right":"escal_med_D",
+
+"posterior_scalene_left":"escal_pos_E",
+"posterior_scalene_right":"escal_pos_D",
+
+"sterno_thyroid_left":"estern_tir_E",
+"sterno_thyroid_right":"estern_tir_D",
+
+"thyrohyoid_left":"tireo_hio_E",
+"thyrohyoid_right":"tireo_hio_D",
+
+"prevertebral_left":"prevert_E",
+"prevertebral_right":"prevert_D",
+
+# ombro/coxa
+"quadriceps_femoris_left":"quadric_E",
+"quadriceps_femoris_right":"quadric_D",
+
+"thigh_medial_compartment_left":"coxa_med_E",
+"thigh_medial_compartment_right":"coxa_med_D",
+
+"thigh_posterior_compartment_left":"coxa_pos_E",
+"thigh_posterior_compartment_right":"coxa_pos_D",
+
+"sartorius_left":"sartorio_E",
+"sartorius_right":"sartorio_D",
+
+"deltoid":"deltoide",
+"supraspinatus":"supraespin",
+"infraspinatus":"infraespin",
+"subscapularis":"subescap",
+"coracobrachial":"coracobr",
+"pectoralis_minor":"peit_menor",
+"serratus_anterior":"serr_ant",
+"teres_major":"redond_mai",
+"triceps_brachii":"triceps",
+
+# ossos apendiculares
+"patella":"patela",
+"tibia":"tibia",
+"fibula":"fibula",
+"tarsal":"tarso",
+"metatarsal":"metatarso",
+"phalanges_feet":"falanges_pe",
+
+"ulna":"ulna",
+"radius":"radio",
+
+"carpal":"carpo",
+"metacarpal":"metacarpo",
+"phalanges_hand":"falanges_mao",
+
+# neuro
+"subarachnoid_space":"esp_subarac",
+"venous_sinuses":"seios_ven",
+"septum_pellucidum":"septo_pel",
+"cerebellum":"cerebelo",
+"caudate_nucleus":"nuc_caud",
+"lentiform_nucleus":"nuc_lent",
+"insular_cortex":"cortex_ins",
+"internal_capsule":"caps_int",
+"ventricle":"ventriculo",
+"central_sulcus":"sulco_cent",
+"frontal_lobe":"lobo_front",
+"parietal_lobe":"lobo_pariet",
+"occipital_lobe":"lobo_occ",
+"temporal_lobe":"lobo_temp",
+"thalamus":"talamo",
+
+# cavidades
+"abdominal_cavity":"cav_abdom",
+"thoracic_cavity":"cav_torax",
+"pericardium":"pericardio",
+"mediastinum":"mediastino",
+
+# aneurisma
+"brain_aneurysm":"aneur_cerb",
+
+# craniofacial
+"mandible":"mandibula",
+"head":"cabeca",
+"sinus_maxillary":"seio_max",
+"sinus_frontal":"seio_front",
+"teeth_lower":"dentes_inf",
+"teeth_upper":"dentes_sup",
+
+# mama
+"breast":"mama"
+
 }
 
 # ---------------------------
@@ -120,6 +436,8 @@ COLOR_PULMAO_D = (0, 0, 200)
 COLOR_PULMOES = (135, 206, 250)
 COLOR_MEDULA_PRV = (255, 165, 0)
 COLOR_COSTELAS = (220, 220, 220)
+COLOR_MAMA_D = (80, 120, 220)
+COLOR_MAMA_E = (220, 100, 160)
 
 # ---------------------------
 # Utilitários de string
@@ -258,6 +576,23 @@ def erode_grouped_by_margin(grouped_by_z: Dict[float, Polygon], margin_mm: float
             continue
     return out
 
+def find_body_roi_key(roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]]) -> Optional[str]:
+    for key in ("corpo", "body"):
+        if key in roi_polygons:
+            return key
+    return None
+
+def find_grouped_polygon_at_z(grouped: Dict[float, Polygon],
+                              z: float,
+                              tolerance_mm: float = 1.0) -> Optional[Polygon]:
+    polygon = grouped.get(z)
+    if polygon is not None:
+        return polygon
+    nearest_z = min(grouped, key=lambda candidate: abs(candidate - z), default=None)
+    if nearest_z is not None and abs(nearest_z - z) <= tolerance_mm:
+        return grouped[nearest_z]
+    return None
+
 # ---------------------------
 # Coleta de ROIs a partir de múltiplos RTSTRUCTs
 # ---------------------------
@@ -316,6 +651,20 @@ def copy_contour_image_sequence_from_sample(sample_roi_contour: Optional[Dataset
         return None
     return [copy.deepcopy(x) for x in cis]
 
+def get_roi_display_color(roi_contour: Optional[Dataset],
+                          fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    color = getattr(roi_contour, "ROIDisplayColor", None) if roi_contour is not None else None
+    if color is None or len(color) < 3:
+        return fallback
+    return (int(color[0]), int(color[1]), int(color[2]))
+
+def lighten_color(color: Tuple[int, int, int], amount: float = 0.45) -> Tuple[int, int, int]:
+    amount = min(max(amount, 0.0), 1.0)
+    return tuple(
+        int(round(channel + (255 - channel) * amount))
+        for channel in color
+    )
+
 def create_roi_contour_item_from_grouped_polys(grouped_by_z: Dict[float, Polygon],
                                                new_number: int,
                                                color_rgb: Optional[Tuple[int, int, int]] = None,
@@ -330,6 +679,8 @@ def create_roi_contour_item_from_grouped_polys(grouped_by_z: Dict[float, Polygon
             continue
         geoms = [geom] if isinstance(geom, Polygon) else list(geom.geoms)
         for g in geoms:
+            if not isinstance(g, Polygon):
+                continue
             contours_pts_list = polygon_to_contour_sequence(g, z, n_points=120)
             for pts in contours_pts_list:
                 contour_item = create_contour_dataset_from_points(pts)
@@ -499,6 +850,66 @@ def main():
                 "sample_roi_contour": sample_spinal
             }
 
+    # Avaliação das mamas: interseção com o corpo erodido em 4 mm.
+    # O corpo erodido é mantido somente em memória e não é exportado.
+    eroded_body = {}
+    body_key = find_body_roi_key(roi_polygons)
+    if body_key is not None:
+        body_polys = [(z, poly) for (z, poly, *rest) in roi_polygons[body_key]]
+        eroded_body = erode_grouped_by_margin(
+            polygons_group_by_z(body_polys),
+            margin_mm=4.0,
+        )
+
+    for breast_key, evaluation_name in (
+        ("breast_right", "mama_D_aval"),
+        ("breast_left", "mama_E_aval"),
+    ):
+        if breast_key not in roi_polygons:
+            if debug and body_key is not None:
+                print(f"Aviso: ROI ausente para {evaluation_name}: {breast_key}.")
+            continue
+
+        breast_polys = [(z, poly) for (z, poly, *rest) in roi_polygons[breast_key]]
+        grouped_breast = polygons_group_by_z(breast_polys)
+        evaluated_breast = {}
+        for z, breast_poly in grouped_breast.items():
+            body_poly = find_grouped_polygon_at_z(eroded_body, z)
+            if body_poly is None:
+                continue
+            intersection = breast_poly.intersection(body_poly)
+            if intersection is not None and not intersection.is_empty:
+                evaluated_breast[z] = intersection
+
+        if not evaluated_breast:
+            if debug:
+                reason = "corpo ausente" if body_key is None else "interseção vazia"
+                print(
+                    f"Aviso: não foi possível criar {evaluation_name} ({reason}); "
+                    f"fatias mama={len(grouped_breast)}, corpo_erodido={len(eroded_body)}."
+                )
+            continue
+
+        sample_breast = None
+        if roi_map_all.get(breast_key, {}).get("samples"):
+            s_ds, s_num, _ = roi_map_all[breast_key]["samples"][0]
+            if hasattr(s_ds, "ROIContourSequence"):
+                for rc in s_ds.ROIContourSequence:
+                    if getattr(rc, "ReferencedROINumber", None) == s_num:
+                        sample_breast = rc
+                        break
+        created_items[evaluation_name] = {
+            "grouped": evaluated_breast,
+            "color": lighten_color(
+                get_roi_display_color(
+                    sample_breast,
+                    COLOR_MAMA_D if breast_key == "breast_right" else COLOR_MAMA_E,
+                )
+            ),
+            "label": evaluation_name,
+            "sample_roi_contour": sample_breast
+        }
+
     # costelas: unir todas as costelas em "costelas" (mantido)
     rib_keys = [k for k in roi_polygons.keys() if k.startswith("rib_") or k.startswith("rib_left_") or k.startswith("rib_right_") or "costela" in k]
     if rib_keys:
@@ -544,13 +955,13 @@ def main():
     if "corpo" in roi_map_all:
         final_order.append(("orig", "corpo", None))
 
-    # 2. mamas: incluir apenas mama_D e mama_E se presentes; não exportar genérico "mama"
+    # 2. mamas: renomear as estruturas originais e incluir as avaliações
     for key in ("breast_right", "breast_left"):
         if key in roi_map_all:
-            rep = list(roi_map_all[key]["original_names"])[0]
-            if translate_name(rep) == "mama":
-                continue
             final_order.append(("orig", key, None))
+    for name in ("mama_D_aval", "mama_E_aval"):
+        if name in created_items:
+            final_order.append(("created", name, None))
 
     # 3. Pulmões: incluir apenas as criadas (pulmao_E, pulmao_D, pulmoes)
     for name in ("pulmao_E", "pulmao_D", "pulmoes"):
@@ -607,7 +1018,7 @@ def main():
         if k in lobes_to_exclude:
             continue
         rep = list(roi_map_all[k]["original_names"])[0]
-        if translate_name(rep) == "mama":
+        if key not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
             continue
         remaining.append(k)
     remaining_sorted = sorted(remaining, key=lambda x: translated_map.get(x, x))
@@ -663,10 +1074,14 @@ def main():
             if not entry:
                 continue
             orig_name = list(entry["original_names"])[0] if entry["original_names"] else key
-            if translate_name(orig_name) == "mama":
+            if key not in ("breast_right", "breast_left") and translate_name(orig_name) == "mama":
                 continue
             t = translate_name(orig_name)
-            if t.lower().startswith("vertebra"):
+            if key == "breast_right":
+                t_disp = "mama_D"
+            elif key == "breast_left":
+                t_disp = "mama_E"
+            elif t.lower().startswith("vertebra"):
                 t_disp = vertebra_display_name(t)
             else:
                 t_disp = t
@@ -688,7 +1103,7 @@ def main():
         if not entry:
             continue
         rep = list(entry["original_names"])[0] if entry["original_names"] else key
-        if translate_name(rep) == "mama":
+        if key not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
             continue
         sample = entry["samples"][0] if entry["samples"] else None
         if sample is None:
@@ -711,7 +1126,7 @@ def main():
                         new_roi_contour.ContourSequence = valid_contours
                         ds_base.ROIContourSequence.append(new_roi_contour)
 
-    # Adicionar criados (pulmao_E, pulmao_D, pulmoes, medula_PRV, costelas)
+    # Adicionar criados (mama_D_aval, pulmao_E, pulmao_D, pulmoes, medula_PRV, costelas)
     for typ, key, region in final_order:
         if typ != "created":
             continue
@@ -738,6 +1153,10 @@ def main():
         if debug:
             print(f"Arquivo salvo: {out_name}")
             print("ROIs criadas:", list(created_items.keys()))
+            print(
+                "Avaliações de mama exportadas:",
+                [name for name in ("mama_D_aval", "mama_E_aval") if name in created_items],
+            )
             print("Ordem final:", final_order)
     except Exception as e:
         print(f"Erro ao salvar {out_name}: {e}")
