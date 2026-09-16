@@ -1,119 +1,242 @@
+#!/usr/bin/env python3
+"""Unifica todas as estruturas de um RTSTRUCT em uma ROI chamada ``corpo``."""
+
 import os
 import sys
-import pydicom
+from typing import Iterable
+
 import numpy as np
-from pydicom.dataset import Dataset
-from skimage import measure, draw
-import scipy.ndimage as ndimage
+import cv2
+from scipy import ndimage
+from rt_utils import RTStruct, RTStructBuilder, image_helper
 
-def hex_to_rgb(hex_color: str):
-    """Converte string hex (#RRGGBB) para lista [R,G,B]."""
-    hex_color = hex_color.lstrip('#')
-    return [int(hex_color[i:i+2], 16) for i in (0, 2, 4)]
 
-def gerar_corpo(input_rtstruct, hex_color="#55ffff"):
-    ds = pydicom.dcmread(input_rtstruct)
+MARGIN_MM = 2.0
+SMOOTH_SIGMA_MM = 0.8
 
-    # Agrupa contornos por fatia Z
-    contours_by_slice = {}
-    for roi_contour in ds.ROIContourSequence:
-        for contour in roi_contour.ContourSequence:
-            pts = np.array(contour.ContourData).reshape(-1, 3)
-            z = round(np.mean(pts[:,2]), 2)
-            if z not in contours_by_slice:
-                contours_by_slice[z] = []
-            contours_by_slice[z].append(pts)
 
-    # Limites espaciais
-    all_points = np.vstack([pts for sl in contours_by_slice.values() for pts in sl])
-    min_x, min_y, min_z = np.min(all_points, axis=0)
-    max_x, max_y, max_z = np.max(all_points, axis=0)
+def hex_to_rgb(hex_color: str) -> list[int]:
+    """Converte uma cor hexadecimal em [R, G, B]."""
+    value = hex_color.removeprefix("#")
+    if len(value) != 6:
+        raise ValueError("A cor deve estar no formato #RRGGBB.")
+    try:
+        channels = [int(value[index:index + 2], 16) for index in (0, 2, 4)]
+    except ValueError as error:
+        raise ValueError("A cor deve estar no formato #RRGGBB.") from error
+    return channels
 
-    grid_size = 256
-    zs = sorted(contours_by_slice.keys())
-    mask = np.zeros((grid_size, grid_size, len(zs)), dtype=np.uint8)
 
-    # Rasteriza cada contorno em sua fatia
-    for iz, z in enumerate(zs):
-        for pts in contours_by_slice[z]:
-            rr = ((pts[:,1]-min_y)/(max_y-min_y)*(grid_size-1)).astype(int)
-            cc = ((pts[:,0]-min_x)/(max_x-min_x)*(grid_size-1)).astype(int)
-            rr, cc = draw.polygon(rr, cc, mask.shape[:2])
-            mask[rr, cc, iz] = 1
+def _slice_spacing_mm(series_data: list) -> float:
+    """Obtém a distância física entre cortes ordenados."""
+    if len(series_data) < 2:
+        return float(getattr(series_data[0], "SliceThickness", 1.0))
 
-    # Suavização e interpolação volumétrica
-    mask = ndimage.binary_closing(mask, iterations=3)
-    mask = ndimage.binary_fill_holes(mask)
-    mask = ndimage.zoom(mask, (1,1,2), order=1)  # aumenta resolução no eixo Z
+    positions = np.asarray(
+        [float(np.dot(
+            np.cross(
+                np.asarray(image.ImageOrientationPatient[:3], dtype=float),
+                np.asarray(image.ImageOrientationPatient[3:], dtype=float),
+            ),
+            np.asarray(image.ImagePositionPatient, dtype=float),
+        )) for image in series_data]
+    )
+    differences = np.abs(np.diff(positions))
+    non_zero = differences[differences > 1e-4]
+    if non_zero.size == 0:
+        return float(getattr(series_data[0], "SliceThickness", 1.0))
+    return float(np.median(non_zero))
 
-    # Suavização extra com filtro gaussiano
-    mask = ndimage.gaussian_filter(mask.astype(float), sigma=1.5) > 0.4
-    mask = mask.astype(np.uint8)
 
-    # Propaga contornos para fatias vazias (primeira e última)
-    for iz in range(mask.shape[2]):
-        if np.sum(mask[:,:,iz]) == 0:
-            if iz > 0:
-                mask[:,:,iz] = mask[:,:,iz-1]
-            elif iz < mask.shape[2]-1:
-                mask[:,:,iz] = mask[:,:,iz+1]
+def _voxel_spacing_mm(series_data: list) -> tuple[float, float, float]:
+    pixel_spacing = np.asarray(series_data[0].PixelSpacing, dtype=float)
+    if pixel_spacing.shape != (2,) or np.any(pixel_spacing <= 0):
+        raise ValueError("PixelSpacing inválido na série DICOM.")
+    slice_spacing = _slice_spacing_mm(series_data)
+    if slice_spacing <= 0:
+        raise ValueError("Não foi possível determinar o espaçamento entre cortes.")
+    return float(pixel_spacing[0]), float(pixel_spacing[1]), slice_spacing
 
-    # Mantém apenas o maior volume conectado
-    labeled, num_features = ndimage.label(mask)
-    if num_features > 1:
-        sizes = ndimage.sum(mask, labeled, range(1, num_features+1))
-        largest_label = (np.argmax(sizes) + 1)
-        mask = (labeled == largest_label).astype(np.uint8)
 
-    # Limpa sequências originais
-    ds.StructureSetROISequence.clear()
-    ds.ROIContourSequence.clear()
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    structure = ndimage.generate_binary_structure(rank=3, connectivity=2)
+    labels, number = ndimage.label(mask, structure=structure)
+    if number == 0:
+        return np.zeros_like(mask, dtype=bool)
+    sizes = np.bincount(labels.ravel())[1:]
+    return labels == (int(np.argmax(sizes)) + 1)
 
-    # Converte cor hex para RGB
-    rgb_color = hex_to_rgb(hex_color)
 
-    # Cria novo ROI "corpo"
-    new_roi = Dataset()
-    new_roi.ROINumber = 15
-    new_roi.ROIName = "corpo"
-    new_roi.ROIGenerationAlgorithm = "AUTOMATIC"
-    new_roi.ROIDisplayColor = rgb_color
-    new_roi.RTROIInterpretedType = "EXTERNAL"
-    ds.StructureSetROISequence.append(new_roi)
+def _dilate_mm(mask: np.ndarray, spacing: tuple[float, float, float],
+               distance_mm: float) -> np.ndarray:
+    distances = ndimage.distance_transform_edt(~mask, sampling=spacing)
+    return distances <= distance_mm
 
-    # Cria ROIContourSequence para o "corpo"
-    new_roi_contour = Dataset()
-    new_roi_contour.ReferencedROINumber = new_roi.ROINumber
-    new_roi_contour.ContourSequence = []
 
-    # Reconverte máscara suavizada em contornos slice a slice
-    for iz, z in enumerate(np.linspace(min_z, max_z, mask.shape[2])):
-        slice_mask = mask[:,:,iz]
-        contours = measure.find_contours(slice_mask, 0.5)
-        for c in contours:
-            xs = c[:,1]/mask.shape[1]*(max_x-min_x)+min_x
-            ys = c[:,0]/mask.shape[0]*(max_y-min_y)+min_y
-            zs = np.full_like(xs, z)
-            coords = np.vstack([xs, ys, zs]).T.flatten().tolist()
+def _erode_mm(mask: np.ndarray, spacing: tuple[float, float, float],
+              distance_mm: float) -> np.ndarray:
+    distances = ndimage.distance_transform_edt(mask, sampling=spacing)
+    return distances > distance_mm
 
-            new_contour = Dataset()
-            new_contour.ContourGeometricType = "CLOSED_PLANAR"
-            new_contour.NumberOfContourPoints = len(xs)
-            new_contour.ContourData = coords
-            new_roi_contour.ContourSequence.append(new_contour)
 
-    ds.ROIContourSequence.append(new_roi_contour)
+def _iter_roi_names(rtstruct) -> Iterable[str]:
+    seen = set()
+    for name in rtstruct.get_roi_names():
+        if name not in seen:
+            seen.add(name)
+            yield name
 
-    # Salva novo RTSTRUCT
+
+def _get_roi_number(rtstruct, name: str):
+    for roi in rtstruct.ds.StructureSetROISequence:
+        if roi.ROIName == name:
+            return roi.ROINumber
+    raise KeyError(f"ROI '{name}' não encontrada na sequência de estruturas.")
+
+
+def _valid_contour(contour) -> bool:
+    try:
+        data = np.asarray(getattr(contour, "ContourData", []), dtype=float)
+        point_count = int(
+            getattr(contour, "NumberOfContourPoints", data.size // 3)
+        )
+    except (TypeError, ValueError):
+        return False
+    if data.size < 9 or data.size % 3 != 0 or not np.isfinite(data).all():
+        return False
+    if point_count < 3:
+        return False
+    if not hasattr(contour, "ContourImageSequence") or not contour.ContourImageSequence:
+        return False
+    points = data.reshape(-1, 3)
+    return np.unique(points, axis=0).shape[0] >= 3
+
+
+def _mask_for_roi(rtstruct, name: str) -> np.ndarray:
+    roi_number = _get_roi_number(rtstruct, name)
+    contour_sequence = []
+    for roi_contour in rtstruct.ds.ROIContourSequence:
+        if str(getattr(roi_contour, "ReferencedROINumber", "")) == str(roi_number):
+            contour_sequence = list(getattr(roi_contour, "ContourSequence", []))
+            break
+
+    valid_contours = [contour for contour in contour_sequence
+                      if _valid_contour(contour)]
+    if not valid_contours:
+        raise ValueError("não há contornos fechados válidos")
+
+    combined = None
+    skipped = 0
+    for contour in valid_contours:
+        try:
+            contour_mask = image_helper.create_series_mask_from_contour_sequence(
+                rtstruct.series_data, [contour]
+            )
+        except (cv2.error, ValueError, IndexError, KeyError, AttributeError,
+                TypeError):
+            skipped += 1
+            continue
+        combined = (contour_mask if combined is None
+                    else np.logical_or(combined, contour_mask))
+
+    if skipped:
+        print(
+            f"Aviso: {skipped} contorno(s) inválido(s) ignorado(s) na ROI '{name}'.",
+            file=sys.stderr,
+        )
+    if combined is None or not combined.any():
+        raise ValueError("todos os contornos falharam na rasterização")
+    return np.asarray(combined, dtype=bool)
+
+
+def _build_body_mask(rtstruct, spacing: tuple[float, float, float]) -> np.ndarray:
+    masks = []
+    for name in _iter_roi_names(rtstruct):
+        try:
+            roi_mask = _mask_for_roi(rtstruct, name)
+        except (RTStruct.ROIException, ValueError, IndexError, KeyError,
+                AttributeError, TypeError) as error:
+            print(f"Aviso: não foi possível rasterizar '{name}': {error}",
+                  file=sys.stderr)
+            continue
+        if roi_mask.any():
+            masks.append(roi_mask)
+
+    if not masks:
+        raise RuntimeError("Nenhuma ROI com contornos rasterizáveis foi encontrada.")
+
+    merged = np.logical_or.reduce(masks)
+    merged = ndimage.binary_fill_holes(merged)
+    expanded = _dilate_mm(merged, spacing, MARGIN_MM)
+    expanded = ndimage.binary_fill_holes(expanded)
+    expanded = _largest_component(expanded)
+
+    body = _erode_mm(expanded, spacing, MARGIN_MM)
+    body = ndimage.binary_fill_holes(body)
+    body = _largest_component(body)
+    if not body.any():
+        raise RuntimeError(
+            "A erosão de 2 mm eliminou a estrutura; verifique a série e os contornos."
+        )
+
+    smooth_sigma = tuple(SMOOTH_SIGMA_MM / value for value in spacing)
+    smoothed = ndimage.gaussian_filter(body.astype(float), sigma=smooth_sigma)
+    body = smoothed >= 0.5
+    body = _largest_component(body)
+    if not body.any():
+        raise RuntimeError("A suavização produziu uma máscara vazia.")
+    return body.astype(bool)
+
+
+def gerar_corpo(input_rtstruct: str, dicom_series_path: str,
+                hex_color: str = "#55ffff") -> str:
+    """Gera ``CORPO.dcm`` usando a geometria física da série DICOM."""
+    color = hex_to_rgb(hex_color)
+    rtstruct = RTStructBuilder.create_from(
+        dicom_series_path=dicom_series_path,
+        rt_struct_path=input_rtstruct,
+    )
+    spacing = _voxel_spacing_mm(rtstruct.series_data)
+    print(
+        "Espaçamento dos voxels (mm): "
+        f"linhas={spacing[0]:.4g}, colunas={spacing[1]:.4g}, cortes={spacing[2]:.4g}"
+    )
+
+    body_mask = _build_body_mask(rtstruct, spacing)
+    print(f"Voxels finais na máscara corpo: {int(body_mask.sum())}")
+
+    # O objeto carregado preserva os metadados e as referências do RTSTRUCT original.
+    rtstruct.ds.StructureSetROISequence.clear()
+    rtstruct.ds.ROIContourSequence.clear()
+    rtstruct.ds.RTROIObservationsSequence.clear()
+    rtstruct.add_roi(
+        mask=body_mask,
+        color=color,
+        name="corpo",
+        description="Unificação das estruturas com margem física de 2 mm",
+        approximate_contours=True,
+        roi_generation_algorithm="AUTOMATIC",
+    )
+
     output_path = os.path.join(os.path.dirname(input_rtstruct), "CORPO.dcm")
-    ds.save_as(output_path)
-    print(f"Novo RTSTRUCT salvo em {output_path} com cor {hex_color} (RGB {rgb_color})")
+    rtstruct.save(output_path)
+    print(f"Novo RTSTRUCT salvo em {output_path}")
+    return output_path
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Uso: python IHaveABody.py <INPUT_RTSTRUCT.dcm> [#RRGGBB]")
-        sys.exit(1)
+
+def main() -> None:
+    if len(sys.argv) not in (3, 4):
+        print(
+            "Uso: python IHaveABody.py "
+            "<INPUT_RTSTRUCT.dcm> <DICOM_SERIES_DIR> [#RRGGBB]"
+        )
+        raise SystemExit(1)
 
     input_rtstruct = sys.argv[1]
-    hex_color = sys.argv[2] if len(sys.argv) > 2 else "#55ffff"
-    gerar_corpo(input_rtstruct, hex_color)
+    dicom_series_path = sys.argv[2]
+    hex_color = sys.argv[3] if len(sys.argv) == 4 else "#55ffff"
+    gerar_corpo(input_rtstruct, dicom_series_path, hex_color)
+
+
+if __name__ == "__main__":
+    main()
