@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import os
 import sys
 import unicodedata
@@ -438,6 +439,75 @@ COLOR_MEDULA_PRV = (255, 165, 0)
 COLOR_COSTELAS = (220, 220, 220)
 COLOR_MAMA_D = (80, 120, 220)
 COLOR_MAMA_E = (220, 100, 160)
+COLOR_RETO = (101, 50, 20)
+COLOR_SIGMOIDE = (204, 85, 0)
+LEFT_STRUCTURE_COLORS = (
+    (0, 70, 160), (0, 105, 210), (25, 135, 190), (45, 85, 180),
+    (70, 150, 220), (20, 170, 200), (90, 100, 210), (0, 145, 170),
+)
+RIGHT_STRUCTURE_COLORS = (
+    (0, 100, 40), (0, 145, 60), (20, 170, 75), (55, 125, 35),
+    (80, 180, 90), (0, 125, 105), (105, 155, 35), (35, 190, 120),
+)
+ANATOMICAL_COLORS = {
+    "corpo": (238, 190, 120),
+    "colon": (150, 75, 0),
+    "sacro": (150, 150, 150),
+    "spinal_cord": (255, 215, 0),
+    "heart": (210, 0, 0),
+    "liver": (125, 45, 25),
+    "kidney": (180, 70, 100),
+    "lung": (100, 200, 220),
+    "brain": (210, 170, 210),
+    "bone": (190, 190, 175),
+}
+NEUTRAL_STRUCTURE_COLORS = (
+    (120, 80, 150), (160, 100, 45), (90, 120, 140), (190, 110, 150),
+    (110, 160, 160), (145, 125, 70), (80, 80, 120), (170, 145, 100),
+)
+THORACIC_VERTEBRA_COLORS = (
+    (30, 90, 180), (0, 145, 210), (0, 175, 190), (55, 125, 220),
+    (85, 80, 190), (0, 120, 165), (70, 165, 220), (25, 150, 145),
+    (100, 105, 210), (0, 160, 175), (45, 110, 205), (80, 145, 195),
+)
+LUMBAR_VERTEBRA_COLORS = (
+    (180, 45, 25), (220, 75, 15), (200, 105, 0), (235, 125, 20),
+    (165, 55, 50), (210, 80, 55), (190, 130, 25),
+)
+SACRAL_STRUCTURE_COLORS = (
+    (125, 55, 135), (155, 75, 155), (180, 95, 130), (110, 70, 145),
+    (145, 90, 110), (170, 65, 120),
+)
+
+MUSCLE_ROI_KEYS = {
+    "autochthon_left", "autochthon_right",
+    "iliopsoas_left", "iliopsoas_right",
+    "gluteus_maximus_left", "gluteus_maximus_right",
+    "gluteus_medius_left", "gluteus_medius_right",
+    "gluteus_minimus_left", "gluteus_minimus_right",
+    "masseter_left", "masseter_right",
+    "temporalis_left", "temporalis_right",
+    "lateral_pterygoid_left", "lateral_pterygoid_right",
+    "medial_pterygoid_left", "medial_pterygoid_right",
+    "digastric_left", "digastric_right",
+    "sternocleidomastoid_left", "sternocleidomastoid_right",
+    "trapezius", "trapezius_left", "trapezius_right",
+    "platysma_left", "platysma_right",
+    "levator_scapulae_left", "levator_scapulae_right",
+    "anterior_scalene_left", "anterior_scalene_right",
+    "middle_scalene_left", "middle_scalene_right",
+    "posterior_scalene_left", "posterior_scalene_right",
+    "sterno_thyroid_left", "sterno_thyroid_right",
+    "thyrohyoid_left", "thyrohyoid_right",
+    "prevertebral_left", "prevertebral_right",
+    "quadriceps_femoris_left", "quadriceps_femoris_right",
+    "thigh_medial_compartment_left", "thigh_medial_compartment_right",
+    "thigh_posterior_compartment_left", "thigh_posterior_compartment_right",
+    "sartorius_left", "sartorius_right",
+    "deltoid", "supraspinatus", "infraspinatus", "subscapularis",
+    "coracobrachial", "pectoralis_minor", "serratus_anterior",
+    "teres_major", "triceps_brachii", "skeletal_muscle",
+}
 
 # ---------------------------
 # Utilitários de string
@@ -544,6 +614,62 @@ def polygons_group_by_z(polygons_with_z: List[Tuple[float, Polygon]]) -> Dict[fl
         out[z] = unary_union(lst) if lst else None
     return out
 
+def colon_components_by_z(
+    colon_polys: List[Tuple[float, Polygon]],
+) -> Dict[float, List[Polygon]]:
+    components_by_z = defaultdict(list)
+    for z, poly in colon_polys:
+        if poly is None or poly.is_empty:
+            continue
+        geometry = poly if isinstance(poly, Polygon) else unary_union(poly)
+        geometries = (
+            [geometry]
+            if isinstance(geometry, Polygon)
+            else [item for item in geometry.geoms if isinstance(item, Polygon)]
+        )
+        components_by_z[round(float(z), 3)].extend(geometries)
+    return dict(components_by_z)
+
+def component_similarity(previous: Polygon, candidate: Polygon) -> float:
+    previous_buffer = previous.buffer(3.0)
+    candidate_buffer = candidate.buffer(3.0)
+    union_area = previous_buffer.union(candidate_buffer).area
+    overlap = (
+        previous_buffer.intersection(candidate_buffer).area / union_area
+        if union_area > 0
+        else 0.0
+    )
+    centroid_distance = previous.centroid.distance(candidate.centroid)
+    area_ratio = min(previous.area, candidate.area) / max(previous.area, candidate.area)
+    return overlap * 5.0 + area_ratio * 2.0 - centroid_distance / 25.0
+
+def track_colon_component_path(
+    colon_polys: List[Tuple[float, Polygon]],
+) -> Dict[float, Polygon]:
+    """Track one continuous colon component from caudal to cranial slices."""
+    components_by_z = colon_components_by_z(colon_polys)
+    if not components_by_z:
+        return {}
+
+    ordered_z = sorted(components_by_z)
+    path = {}
+    previous = max(
+        components_by_z[ordered_z[0]],
+        key=lambda component: component.area,
+    )
+    path[ordered_z[0]] = previous
+
+    for z in ordered_z[1:]:
+        candidates = components_by_z[z]
+        if not candidates:
+            continue
+        previous = max(
+            candidates,
+            key=lambda candidate: component_similarity(previous, candidate),
+        )
+        path[z] = previous
+    return path
+
 # ---------------------------
 # Buffer / erosão
 # ---------------------------
@@ -582,6 +708,89 @@ def find_body_roi_key(roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset
             return key
     return None
 
+def is_muscle_roi(key: str, original_names: Optional[set] = None) -> bool:
+    if key in MUSCLE_ROI_KEYS:
+        return True
+    names = original_names or set()
+    normalized_names = {normalize_name(name) for name in names}
+    return bool(normalized_names & MUSCLE_ROI_KEYS)
+
+def structure_side(name: str) -> Optional[str]:
+    normalized = normalize_name(name)
+    if normalized.endswith("_e"):
+        return "left"
+    if normalized.endswith("_d"):
+        return "right"
+    return None
+
+def choose_structure_color(
+    key: str,
+    display_name: str,
+    used_colors: set,
+    side_indexes: Dict[str, int],
+) -> Tuple[int, int, int]:
+    if key in ("breast_right", "breast_left"):
+        return (0, 0, 0)
+
+    normalized_key = normalize_name(key)
+    normalized_display = normalize_name(display_name)
+    vertebra_palette = None
+    is_thoracic_display = (
+        normalized_display.startswith("t")
+        and normalized_display[1:].isdigit()
+    )
+    is_lumbar_display = (
+        normalized_display.startswith("l")
+        and normalized_display[1:].isdigit()
+    )
+    is_sacral_display = (
+        normalized_display.startswith("s")
+        and normalized_display[1:].isdigit()
+    )
+    if normalized_key.startswith("vertebrae_t") or is_thoracic_display:
+        vertebra_palette = THORACIC_VERTEBRA_COLORS
+    elif normalized_key.startswith("vertebrae_l") or is_lumbar_display:
+        vertebra_palette = LUMBAR_VERTEBRA_COLORS
+    elif normalized_key.startswith("vertebrae_s") or is_sacral_display:
+        vertebra_palette = SACRAL_STRUCTURE_COLORS
+    elif normalized_key in ("sacro", "sacrum"):
+        vertebra_palette = SACRAL_STRUCTURE_COLORS
+    if vertebra_palette is not None:
+        for color in vertebra_palette:
+            if color not in used_colors:
+                return color
+
+    if normalized_key == "urinary_bladder" or normalized_display == "bexiga":
+        bladder_color = (255, 220, 0)
+        if bladder_color not in used_colors:
+            return bladder_color
+
+    side = structure_side(display_name) or structure_side(key)
+    if side is not None:
+        palette = LEFT_STRUCTURE_COLORS if side == "left" else RIGHT_STRUCTURE_COLORS
+        start = side_indexes[side]
+        for offset in range(len(palette)):
+            color = palette[(start + offset) % len(palette)]
+            if color not in used_colors:
+                side_indexes[side] = (start + offset + 1) % len(palette)
+                return color
+
+    for anatomy_key, color in ANATOMICAL_COLORS.items():
+        if anatomy_key in key or anatomy_key in normalize_name(display_name):
+            if color not in used_colors:
+                return color
+
+    for color in NEUTRAL_STRUCTURE_COLORS:
+        if color not in used_colors:
+            return color
+
+    # The palettes above provide enough colors for the expected RTSTRUCTs.
+    # This deterministic fallback keeps colors unique for unusually large sets.
+    candidate = tuple((37 * (len(used_colors) + channel + 1)) % 256 for channel in range(3))
+    while candidate in used_colors:
+        candidate = tuple((value + 17) % 256 for value in candidate)
+    return candidate
+
 def find_grouped_polygon_at_z(grouped: Dict[float, Polygon],
                               z: float,
                               tolerance_mm: float = 1.0) -> Optional[Polygon]:
@@ -592,6 +801,138 @@ def find_grouped_polygon_at_z(grouped: Dict[float, Polygon],
     if nearest_z is not None and abs(nearest_z - z) <= tolerance_mm:
         return grouped[nearest_z]
     return None
+
+def centroid_z_range(polygons: List[Tuple[float, Polygon]]) -> Tuple[float, float]:
+    zs = [float(z) for z, _ in polygons]
+    return min(zs), max(zs)
+
+def estimate_colorectal_transition_z(
+    roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]],
+    colon_polys: List[Tuple[float, Polygon]],
+) -> Tuple[float, str]:
+    """Estimate the rectosigmoid transition from the 3-D colon trajectory.
+
+    The transition is selected where the colon leaves the sacral midline and
+    develops a persistent lateral displacement or turn. Sacral structures are
+    used to define a patient-specific axis; z is used only to order slices.
+    """
+    grouped_colon = polygons_group_by_z(colon_polys)
+    trajectory = sorted(
+        (z, poly.centroid.x, poly.centroid.y)
+        for z, poly in grouped_colon.items()
+        if poly is not None and not poly.is_empty
+    )
+    if len(trajectory) < 3:
+        colon_min, colon_max = centroid_z_range(colon_polys)
+        return colon_min + 0.40 * (colon_max - colon_min), "colon_fallback_short"
+
+    landmark_keys = ("vertebrae_s3", "vertebra_s3", "sacro", "sacrum")
+    landmarks = []
+    landmark_source = "colon_axis"
+    for key in landmark_keys:
+        if key not in roi_polygons:
+            continue
+        grouped = polygons_group_by_z([
+            (z, poly) for z, poly, *_ in roi_polygons[key]
+        ])
+        landmarks = sorted(
+            (z, poly.centroid.x, poly.centroid.y)
+            for z, poly in grouped.items()
+            if poly is not None and not poly.is_empty
+        )
+        if landmarks:
+            landmark_source = key
+            break
+
+    if landmarks:
+        landmark_z = [item[0] for item in landmarks]
+        landmark_x = [item[1] for item in landmarks]
+        landmark_y = [item[2] for item in landmarks]
+        if len(landmarks) >= 2:
+            axis_x = np.polyfit(landmark_z, landmark_x, 1)
+            axis_y = np.polyfit(landmark_z, landmark_y, 1)
+            axis_at = lambda z: (
+                float(np.polyval(axis_x, z)),
+                float(np.polyval(axis_y, z)),
+            )
+        else:
+            axis_at = lambda z: (landmark_x[0], landmark_y[0])
+        anchor_z = float(np.median(landmark_z))
+    else:
+        colon_z = [item[0] for item in trajectory]
+        colon_x = [item[1] for item in trajectory]
+        colon_y = [item[2] for item in trajectory]
+        axis_x = np.polyfit(colon_z, colon_x, 1)
+        axis_y = np.polyfit(colon_z, colon_y, 1)
+        axis_at = lambda z: (
+            float(np.polyval(axis_x, z)),
+            float(np.polyval(axis_y, z)),
+        )
+        anchor_z = float(np.median(colon_z))
+
+    # Median smoothing suppresses isolated contour artifacts without changing
+    # the slice grid or the original contour geometry.
+    smoothed = []
+    for index, (z, x, y) in enumerate(trajectory):
+        window = trajectory[max(0, index - 2):min(len(trajectory), index + 3)]
+        smoothed.append((
+            z,
+            float(np.median([item[1] for item in window])),
+            float(np.median([item[2] for item in window])),
+        ))
+
+    distances = []
+    for z, x, y in smoothed:
+        axis_x_at, axis_y_at = axis_at(z)
+        distances.append(math.hypot(x - axis_x_at, y - axis_y_at))
+
+    turns = [0.0] * len(smoothed)
+    for index in range(1, len(smoothed) - 1):
+        before = np.subtract(smoothed[index], smoothed[index - 1])[1:]
+        after = np.subtract(smoothed[index + 1], smoothed[index])[1:]
+        before_norm = np.linalg.norm(before)
+        after_norm = np.linalg.norm(after)
+        if before_norm > 0 and after_norm > 0:
+            cosine = float(np.dot(before, after) / (before_norm * after_norm))
+            turns[index] = math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
+
+    # Require the lateral/curvature change to persist for at least three
+    # slices, avoiding classification of isolated sigmoid loops as transition.
+    candidates = []
+    for index in range(1, len(smoothed) - 2):
+        persistent = all(
+            distances[offset] >= 25.0 or turns[offset] >= 25.0
+            for offset in range(index, min(index + 3, len(smoothed)))
+        )
+        if persistent:
+            candidates.append(index)
+
+    if candidates:
+        index = min(candidates, key=lambda item: abs(smoothed[item][0] - anchor_z))
+        transition_z = (smoothed[index - 1][0] + smoothed[index][0]) / 2.0
+        return transition_z, f"{landmark_source}_trajectory"
+
+    if landmarks:
+        return anchor_z, f"{landmark_source}_fallback"
+
+    colon_min, colon_max = centroid_z_range(colon_polys)
+    return colon_min + 0.40 * (colon_max - colon_min), "colon_fallback"
+
+def estimate_sigmoid_cranial_limit_z(
+    roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]],
+    colon_polys: List[Tuple[float, Polygon]],
+    margin_mm: float = 10.0,
+) -> Tuple[float, str]:
+    """Use the last cranial sacral slice as the sigmoid cranial limit."""
+    for key in ("sacro", "sacrum"):
+        if key not in roi_polygons:
+            continue
+        sacrum_zs = [float(z) for z, *_ in roi_polygons[key]]
+        if sacrum_zs:
+            return max(sacrum_zs), key
+
+    _, colon_max = centroid_z_range(colon_polys)
+    return colon_max, "colon_fallback"
 
 # ---------------------------
 # Coleta de ROIs a partir de múltiplos RTSTRUCTs
@@ -910,6 +1251,58 @@ def main():
             "sample_roi_contour": sample_breast
         }
 
+    # Separação anatômico-geométrica do cólon em reto e sigmoide.
+    if "colon" in roi_polygons:
+        colon_polys = [(z, poly) for (z, poly, *rest) in roi_polygons["colon"]]
+        grouped_colon = polygons_group_by_z(colon_polys)
+        tracked_colon = track_colon_component_path(colon_polys)
+        transition_z, transition_source = estimate_colorectal_transition_z(
+            roi_polygons,
+            colon_polys,
+        )
+        cranial_limit_z, cranial_limit_source = estimate_sigmoid_cranial_limit_z(
+            roi_polygons,
+            colon_polys,
+            margin_mm=10.0,
+        )
+        rectum_grouped = {
+            z: poly for z, poly in tracked_colon.items()
+            if z <= transition_z
+        }
+        sigmoid_grouped = {
+            z: poly for z, poly in tracked_colon.items()
+            if transition_z < z <= cranial_limit_z
+        }
+        sample_colon = find_sample_roi_contour_for_keys(["colon"])
+        if rectum_grouped:
+            created_items["reto"] = {
+                "grouped": rectum_grouped,
+                "color": COLOR_RETO,
+                "label": "reto",
+                "sample_roi_contour": sample_colon
+            }
+        if sigmoid_grouped:
+            created_items["sigmoide"] = {
+                "grouped": sigmoid_grouped,
+                "color": COLOR_SIGMOIDE,
+                "label": "sigmoide",
+                "sample_roi_contour": sample_colon
+            }
+        if debug:
+            uncertain = sorted(
+                z for z in grouped_colon
+                if abs(z - transition_z) <= 5.0
+            )
+            print(
+                f"Separação colon: transição z={transition_z:.3f} mm "
+                f"(fonte={transition_source}), reto={len(rectum_grouped)} "
+                f"fatias, sigmoide={len(sigmoid_grouped)} fatias, "
+                f"limite_cranial_sigmoide={cranial_limit_z:.3f} mm "
+                f"(fonte={cranial_limit_source}), "
+                f"zona_incerteza={len(uncertain)} fatias, "
+                f"componentes_rastreados={len(tracked_colon)}."
+            )
+
     # costelas: unir todas as costelas em "costelas" (mantido)
     rib_keys = [k for k in roi_polygons.keys() if k.startswith("rib_") or k.startswith("rib_left_") or k.startswith("rib_right_") or "costela" in k]
     if rib_keys:
@@ -960,6 +1353,9 @@ def main():
         if key in roi_map_all:
             final_order.append(("orig", key, None))
     for name in ("mama_D_aval", "mama_E_aval"):
+        if name in created_items:
+            final_order.append(("created", name, None))
+    for name in ("reto", "sigmoide"):
         if name in created_items:
             final_order.append(("created", name, None))
 
@@ -1024,6 +1420,21 @@ def main():
     remaining_sorted = sorted(remaining, key=lambda x: translated_map.get(x, x))
     for k in remaining_sorted:
         final_order.append(("orig", k, None))
+
+    muscle_keys_removed = {
+        key for key, entry in roi_map_all.items()
+        if is_muscle_roi(key, entry.get("original_names"))
+    }
+    if muscle_keys_removed:
+        final_order = [
+            item for item in final_order
+            if not (item[0] == "orig" and item[1] in muscle_keys_removed)
+        ]
+        if debug:
+            print(
+                "Estruturas musculares removidas:",
+                sorted(muscle_keys_removed),
+            )
 
     # ---------------------------
     # Atribuir números sequenciais e construir sequências DICOM
@@ -1094,6 +1505,12 @@ def main():
 
     # Terceira parte: construir ROIContourSequence
     exclude_individual_ribs = "costelas" in created_items
+    used_colors = {
+        tuple(item["color"])
+        for item in created_items.values()
+        if item.get("color") is not None
+    }
+    side_indexes = {"left": 0, "right": 0}
     for typ, key, region in final_order:
         if typ != "orig":
             continue
@@ -1105,6 +1522,14 @@ def main():
         rep = list(entry["original_names"])[0] if entry["original_names"] else key
         if key not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
             continue
+        translated = translate_name(rep)
+        if key == "breast_right":
+            display_name = "mama_D"
+        elif key == "breast_left":
+            display_name = "mama_E"
+        else:
+            display_name = translated
+        source_color = None
         sample = entry["samples"][0] if entry["samples"] else None
         if sample is None:
             continue
@@ -1115,8 +1540,26 @@ def main():
                     continue
                 new_roi_contour = copy.deepcopy(roi_contour)
                 new_roi_contour.ReferencedROINumber = roi_number_map.get((typ, key))
-                if not hasattr(new_roi_contour, "ROIDisplayColor"):
-                    new_roi_contour.ROIDisplayColor = [0, 255, 0]
+                if key in ("breast_right", "breast_left"):
+                    source_color = get_roi_display_color(
+                        roi_contour,
+                        COLOR_MAMA_D if key == "breast_right" else COLOR_MAMA_E,
+                    )
+                    color = source_color
+                elif key == "corpo":
+                    color = get_roi_display_color(
+                        roi_contour,
+                        ANATOMICAL_COLORS["corpo"],
+                    )
+                else:
+                    color = choose_structure_color(
+                        key,
+                        display_name,
+                        used_colors,
+                        side_indexes,
+                    )
+                new_roi_contour.ROIDisplayColor = [int(channel) for channel in color]
+                used_colors.add(color)
                 if hasattr(new_roi_contour, "ContourSequence"):
                     valid_contours = []
                     for c in new_roi_contour.ContourSequence:

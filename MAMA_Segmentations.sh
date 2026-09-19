@@ -12,4 +12,4 @@ python /home/borges/Codigos_AutoSegmentacao/BreastSplit.py $DICOMFolder $DICOMFo
 python /home/borges/Codigos_AutoSegmentacao/NothingBreaksLikeAHeart.py $DICOMFolder/HEART.dcm $DICOMFolder
 python /home/borges/Codigos_AutoSegmentacao/IHaveABody.py $DICOMFolder/BODY.dcm $DICOMFolder
 
-python /home/borges/Codigos_AutoSegmentacao/unir_rtstructs_MAMA.py -o $DICOMFolder/GrupoMama.dcm  $DICOMFolder/Cardiac_area.dcm $DICOMFolder/BREASTS_separado.dcm $DICOMFolder/TOTAL_MAMA.dcm $DICOMFolder/CORO.dcm $DICOMFolder/CORPO.dcm #$DICOMFolder/TISSUE.dcm
+python /home/borges/Codigos_AutoSegmentacao/unir_rtstructs.py -o $DICOMFolder/GrupoMama.dcm  $DICOMFolder/Cardiac_area.dcm $DICOMFolder/BREASTS_separado.dcm $DICOMFolder/TOTAL_MAMA.dcm $DICOMFolder/CORO.dcm $DICOMFolder/CORPO.dcm #$DICOMFolder/TISSUE.dcm
