@@ -470,6 +470,10 @@ THORACIC_VERTEBRA_COLORS = (
     (85, 80, 190), (0, 120, 165), (70, 165, 220), (25, 150, 145),
     (100, 105, 210), (0, 160, 175), (45, 110, 205), (80, 145, 195),
 )
+CERVICAL_VERTEBRA_COLORS = (
+    (0, 85, 35), (0, 120, 50), (20, 155, 60), (55, 185, 75),
+    (75, 125, 45), (0, 145, 105), (80, 175, 100),
+)
 LUMBAR_VERTEBRA_COLORS = (
     (180, 45, 25), (220, 75, 15), (200, 105, 0), (235, 125, 20),
     (165, 55, 50), (210, 80, 55), (190, 130, 25),
@@ -490,14 +494,12 @@ MUSCLE_ROI_KEYS = {
     "lateral_pterygoid_left", "lateral_pterygoid_right",
     "medial_pterygoid_left", "medial_pterygoid_right",
     "digastric_left", "digastric_right",
-    "sternocleidomastoid_left", "sternocleidomastoid_right",
     "trapezius", "trapezius_left", "trapezius_right",
     "platysma_left", "platysma_right",
     "levator_scapulae_left", "levator_scapulae_right",
     "anterior_scalene_left", "anterior_scalene_right",
     "middle_scalene_left", "middle_scalene_right",
     "posterior_scalene_left", "posterior_scalene_right",
-    "sterno_thyroid_left", "sterno_thyroid_right",
     "thyrohyoid_left", "thyrohyoid_right",
     "prevertebral_left", "prevertebral_right",
     "quadriceps_femoris_left", "quadriceps_femoris_right",
@@ -747,7 +749,13 @@ def choose_structure_color(
         normalized_display.startswith("s")
         and normalized_display[1:].isdigit()
     )
-    if normalized_key.startswith("vertebrae_t") or is_thoracic_display:
+    is_cervical_display = (
+        normalized_display.startswith("c")
+        and normalized_display[1:].isdigit()
+    )
+    if normalized_key.startswith("vertebrae_c") or is_cervical_display:
+        vertebra_palette = CERVICAL_VERTEBRA_COLORS
+    elif normalized_key.startswith("vertebrae_t") or is_thoracic_display:
         vertebra_palette = THORACIC_VERTEBRA_COLORS
     elif normalized_key.startswith("vertebrae_l") or is_lumbar_display:
         vertebra_palette = LUMBAR_VERTEBRA_COLORS
