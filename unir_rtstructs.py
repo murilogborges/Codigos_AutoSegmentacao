@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-unir_rtstructs_xio_full.py
-Versão otimizada e completa com traduções estendidas e criação de medula_PRV.
-Uso: python unir_rtstructs_xio_full.py -o saida.dcm arquivo1.dcm arquivo2.dcm ...
+Combina RTSTRUCTs, traduz nomes anatômicos e gera estruturas derivadas.
+Uso: python unir_rtstructs.py -o saida.dcm arquivo1.dcm arquivo2.dcm ...
 Dependências: pydicom, numpy, shapely
 """
 from __future__ import annotations
@@ -14,7 +13,7 @@ import math
 import os
 import sys
 import unicodedata
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -29,6 +28,8 @@ from shapely.ops import unary_union
 # ---------------------------
 MAX_NAME_LEN = 15
 RTSTRUCT_SOPCLASS = "1.2.840.10008.5.1.4.1.1.481.3"  # RT Structure Set Storage
+TRONCO_MAX_SLICE_GAP_MM = 5.0
+TRONCO_MIN_CONNECTION_MARGIN_MM = 3.0
 
 TRADUCAO = {
 
@@ -108,7 +109,7 @@ TRADUCAO = {
 
 # SNC
 "brain":"cerebro",
-"brainstem":"tronco_enc",
+"brainstem":"tronco",
 "skull":"cranio",
 
 # vias aéreas
@@ -195,7 +196,7 @@ TRADUCAO = {
 
 # fígado
 "liver_vessels":"vasos_fig",
-"liver_tumor":"tumor_fig",
+"liver_tumor":"TUMOR_FIGADO",
 
 "liver_segment_1":"seg_fig_1",
 "liver_segment_2":"seg_fig_2",
@@ -432,23 +433,71 @@ TRADUCAO = {
 # ---------------------------
 # Cores (RGB)
 # ---------------------------
-COLOR_PULMAO_E = (0, 200, 0)
-COLOR_PULMAO_D = (0, 0, 200)
+COLOR_PULMAO_E = (0, 55, 135)
+COLOR_PULMAO_D = (0, 100, 20)
 COLOR_PULMOES = (135, 206, 250)
 COLOR_MEDULA_PRV = (255, 165, 0)
 COLOR_COSTELAS = (220, 220, 220)
-COLOR_MAMA_D = (80, 120, 220)
-COLOR_MAMA_E = (220, 100, 160)
+COLOR_CARDIAC_AREA = (188, 92, 104)
+COLOR_TRONCO = (0, 95, 105)
+COLOR_MAMA_D = (140, 70, 190)
+COLOR_MAMA_E = (220, 90, 160)
 COLOR_RETO = (101, 50, 20)
 COLOR_SIGMOIDE = (204, 85, 0)
-LEFT_STRUCTURE_COLORS = (
-    (0, 70, 160), (0, 105, 210), (25, 135, 190), (45, 85, 180),
-    (70, 150, 220), (20, 170, 200), (90, 100, 210), (0, 145, 170),
+COLOR_CORONARY_ARTERIES = (255, 35, 0)
+COLOR_LIVER_TUMOR = (255, 80, 0)
+# Cobre nomes originais e traduções usadas nos diferentes conjuntos de RTSTRUCT.
+LIVER_ALERT_ROI_NAMES = {
+    "liver_tumor",
+    "liver_lesions",
+    "tumor_figado",
+    "lesoes_fig",
+}
+HEART_CHAMBER_COLORS = {
+    "heart_atrium_left": (220, 20, 60),
+    "heart_atrium_right": (178, 34, 34),
+    "heart_ventricle_left": (255, 0, 0),
+    "heart_ventricle_right": (205, 55, 55),
+}
+# Cada par mantém a mesma intensidade aproximada: azul identifica esquerda e verde, direita.
+BILATERAL_BASE_PAIRS = (
+    ((0, 75, 170), (0, 140, 35)),
+    ((0, 105, 195), (20, 165, 50)),
+    ((35, 95, 215), (0, 155, 75)),
+    ((0, 130, 180), (40, 175, 65)),
+    ((45, 115, 200), (75, 160, 40)),
+    ((15, 80, 230), (0, 135, 100)),
+    ((65, 135, 215), (50, 190, 85)),
+    ((0, 95, 155), (0, 170, 25)),
 )
-RIGHT_STRUCTURE_COLORS = (
-    (0, 100, 40), (0, 145, 60), (20, 170, 75), (55, 125, 35),
-    (80, 180, 90), (0, 125, 105), (105, 155, 35), (35, 190, 120),
+BILATERAL_SHADE_FACTORS = (0.72, 1.0, 1.22, 1.42)
+BILATERAL_COLOR_PAIRS = tuple(
+    (
+        tuple(min(255, round(channel * factor)) for channel in blue),
+        tuple(min(255, round(channel * factor)) for channel in green),
+    )
+    for blue, green in BILATERAL_BASE_PAIRS
+    for factor in BILATERAL_SHADE_FACTORS
 )
+# Tons específicos afastam visualmente estruturas bilaterais que ficam próximas.
+BILATERAL_COLOR_OVERRIDES = {
+    "lung": ((0, 55, 135), (0, 100, 20)),
+    "humerus": ((70, 165, 245), (75, 205, 85)),
+    "scapula": ((25, 125, 220), (30, 165, 55)),
+    "clavicula": ((100, 185, 245), (120, 220, 90)),
+    "femur": ((0, 85, 185), (0, 145, 45)),
+    "hip": ((45, 115, 205), (45, 160, 65)),
+    "kidney": ((0, 75, 175), (0, 130, 35)),
+}
+BRAIN_COLOR = (255, 195, 220)
+BRAIN_STRUCTURE_COLORS = {
+    "brain": BRAIN_COLOR,
+    "cerebellum": (220, 145, 180),
+    "frontal_lobe": (255, 225, 238),
+    "parietal_lobe": (250, 215, 232),
+    "occipital_lobe": (255, 232, 242),
+    "temporal_lobe": (248, 205, 228),
+}
 ANATOMICAL_COLORS = {
     "corpo": (238, 190, 120),
     "colon": (150, 75, 0),
@@ -494,6 +543,7 @@ MUSCLE_ROI_KEYS = {
     "lateral_pterygoid_left", "lateral_pterygoid_right",
     "medial_pterygoid_left", "medial_pterygoid_right",
     "digastric_left", "digastric_right",
+    "sternocleidomastoid_left", "sternocleidomastoid_right",
     "trapezius", "trapezius_left", "trapezius_right",
     "platysma_left", "platysma_right",
     "levator_scapulae_left", "levator_scapulae_right",
@@ -509,6 +559,32 @@ MUSCLE_ROI_KEYS = {
     "deltoid", "supraspinatus", "infraspinatus", "subscapularis",
     "coracobrachial", "pectoralis_minor", "serratus_anterior",
     "teres_major", "triceps_brachii", "skeletal_muscle",
+}
+ALLOWED_MUSCLE_ROI_KEYS = {
+    "sternocleidomastoid_left",
+    "sternocleidomastoid_right",
+}
+EXCLUDED_ROI_KEYS = {
+    "auditory_canal_left",
+    "auditory_canal_right",
+    "nasal_cavity_left",
+    "nasal_cavity_right",
+    "internal_capsule",
+    "insular_cortex",
+    "subarachnoid_space",
+    "hypopharynx",
+    "caudate_nucleus",
+    "lentiform_nucleus",
+    "venous_sinuses",
+    "septum_pellucidum",
+    "subclavian_artery_left",
+    "subclavian_artery_right",
+    "central_sulcus",
+    "thalamus",
+    "brachiocephalic_trunk",
+    "brachiocephalic_vein_left",
+    "brachiocephalic_vein_right",
+    "ventricle",
 }
 
 # ---------------------------
@@ -648,7 +724,7 @@ def component_similarity(previous: Polygon, candidate: Polygon) -> float:
 def track_colon_component_path(
     colon_polys: List[Tuple[float, Polygon]],
 ) -> Dict[float, Polygon]:
-    """Track one continuous colon component from caudal to cranial slices."""
+    """Rastreia um componente contínuo do cólon das fatias caudais às craniais."""
     components_by_z = colon_components_by_z(colon_polys)
     if not components_by_z:
         return {}
@@ -670,6 +746,87 @@ def track_colon_component_path(
             key=lambda candidate: component_similarity(previous, candidate),
         )
         path[z] = previous
+    return path
+
+def build_tronco_grouped(
+    brainstem_polys: List[Tuple[float, Polygon]],
+    internal_capsule_polys: List[Tuple[float, Polygon]],
+    spinal_cord_polys: List[Tuple[float, Polygon]],
+) -> Dict[float, Polygon]:
+    if not brainstem_polys or not internal_capsule_polys:
+        return {}
+
+    grouped_brainstem = polygons_group_by_z(brainstem_polys)
+    grouped_capsule = polygons_group_by_z(internal_capsule_polys)
+    grouped_spinal = polygons_group_by_z(spinal_cord_polys)
+    capsule_zs = set(grouped_capsule)
+    spinal_zs = set(grouped_spinal)
+    if not capsule_zs:
+        return {}
+
+    # No sistema de coordenadas DICOM do paciente, Z crescente aponta para cranial.
+    caudal_capsule_boundary = min(capsule_zs)
+    components_by_z = colon_components_by_z(
+        [
+            (z, poly)
+            for z, poly in grouped_brainstem.items()
+            if z < caudal_capsule_boundary
+            and z not in capsule_zs
+            and z not in spinal_zs
+        ]
+    )
+    ordered_z = sorted(components_by_z)
+    if not ordered_z:
+        return {}
+
+    path = {}
+    first_z = ordered_z[0]
+    candidates = components_by_z[first_z]
+    if grouped_spinal:
+        spinal_z = min(grouped_spinal, key=lambda z: abs(z - first_z))
+        spinal_components = colon_components_by_z(
+            [(spinal_z, grouped_spinal[spinal_z])]
+        )[spinal_z]
+        spinal_anchor = max(spinal_components, key=lambda component: component.area)
+        z_gap = abs(first_z - spinal_z)
+        if z_gap > TRONCO_MAX_SLICE_GAP_MM:
+            return {}
+        connection_limit = max(TRONCO_MIN_CONNECTION_MARGIN_MM, z_gap)
+        connected = [
+            candidate
+            for candidate in candidates
+            if candidate.distance(spinal_anchor) <= connection_limit
+        ]
+        if not connected:
+            return {}
+        previous = max(
+            connected,
+            key=lambda candidate: component_similarity(spinal_anchor, candidate),
+        )
+    else:
+        previous = max(candidates, key=lambda component: component.area)
+    path[first_z] = previous
+
+    previous_z = first_z
+    for z in ordered_z[1:]:
+        z_gap = abs(z - previous_z)
+        if z_gap > TRONCO_MAX_SLICE_GAP_MM:
+            break
+        connection_limit = max(TRONCO_MIN_CONNECTION_MARGIN_MM, z_gap)
+        connected = [
+            candidate
+            for candidate in components_by_z[z]
+            if candidate.distance(previous) <= connection_limit
+        ]
+        if not connected:
+            break
+        previous = max(
+            connected,
+            key=lambda candidate: component_similarity(previous, candidate),
+        )
+        path[z] = previous
+        previous_z = z
+
     return path
 
 # ---------------------------
@@ -717,11 +874,54 @@ def is_muscle_roi(key: str, original_names: Optional[set] = None) -> bool:
     normalized_names = {normalize_name(name) for name in names}
     return bool(normalized_names & MUSCLE_ROI_KEYS)
 
-def structure_side(name: str) -> Optional[str]:
-    normalized = normalize_name(name)
-    if normalized.endswith("_e"):
+def should_export_original_roi(key: str, original_names: Optional[set] = None) -> bool:
+    normalized_key = normalize_name(key)
+    normalized_names = {
+        normalize_name(name) for name in (original_names or set())
+    }
+    names_to_check = normalized_names | {normalized_key}
+
+    if names_to_check & EXCLUDED_ROI_KEYS:
+        return False
+    if any("carotid" in name for name in names_to_check):
+        return False
+    if any("pharyngeal_constrictor" in name for name in names_to_check):
+        return False
+    if any(
+        name.startswith(("sterno_thyroid", "sternothyroid"))
+        for name in names_to_check
+    ):
+        return False
+    if normalized_key == "brainstem":
+        return False
+    if is_muscle_roi(key, original_names) and not (
+        names_to_check & ALLOWED_MUSCLE_ROI_KEYS
+    ):
+        return False
+    return True
+
+def structure_pair_key(key: str, display_name: str) -> Optional[str]:
+    normalized_key = normalize_name(key)
+    for suffix in ("_left", "_right"):
+        if normalized_key.endswith(suffix):
+            return normalized_key[:-len(suffix)]
+
+    normalized_display = normalize_name(display_name)
+    if normalized_display.endswith(("_e", "_d")):
+        return normalized_display[:-2]
+    return None
+
+def structure_laterality(key: str, display_name: str) -> Optional[str]:
+    normalized_key = normalize_name(key)
+    if normalized_key.endswith("_left"):
         return "left"
-    if normalized.endswith("_d"):
+    if normalized_key.endswith("_right"):
+        return "right"
+
+    normalized_display = normalize_name(display_name)
+    if normalized_display.endswith("_e"):
+        return "left"
+    if normalized_display.endswith("_d"):
         return "right"
     return None
 
@@ -729,13 +929,23 @@ def choose_structure_color(
     key: str,
     display_name: str,
     used_colors: set,
-    side_indexes: Dict[str, int],
+    paired_colors: Dict[str, int],
 ) -> Tuple[int, int, int]:
-    if key in ("breast_right", "breast_left"):
-        return (0, 0, 0)
-
     normalized_key = normalize_name(key)
     normalized_display = normalize_name(display_name)
+    if normalized_key == "cardiac_area":
+        return COLOR_CARDIAC_AREA
+    if normalized_key in HEART_CHAMBER_COLORS:
+        return HEART_CHAMBER_COLORS[normalized_key]
+    if normalized_key == "coronary_arteries":
+        return COLOR_CORONARY_ARTERIES
+    if {normalized_key, normalized_display} & LIVER_ALERT_ROI_NAMES:
+        return COLOR_LIVER_TUMOR
+    if normalized_key in BRAIN_STRUCTURE_COLORS:
+        return BRAIN_STRUCTURE_COLORS[normalized_key]
+    if normalized_key in ("breast_right", "breast_left"):
+        return COLOR_MAMA_D if normalized_key == "breast_right" else COLOR_MAMA_E
+
     vertebra_palette = None
     is_thoracic_display = (
         normalized_display.startswith("t")
@@ -773,18 +983,45 @@ def choose_structure_color(
         if bladder_color not in used_colors:
             return bladder_color
 
-    side = structure_side(display_name) or structure_side(key)
-    if side is not None:
-        palette = LEFT_STRUCTURE_COLORS if side == "left" else RIGHT_STRUCTURE_COLORS
-        start = side_indexes[side]
-        for offset in range(len(palette)):
-            color = palette[(start + offset) % len(palette)]
-            if color not in used_colors:
-                side_indexes[side] = (start + offset + 1) % len(palette)
-                return color
+    pair_key = structure_pair_key(key, display_name)
+    laterality = structure_laterality(key, display_name)
+    if pair_key is not None and laterality is not None:
+        if pair_key in BILATERAL_COLOR_OVERRIDES:
+            blue, green = BILATERAL_COLOR_OVERRIDES[pair_key]
+            return blue if laterality == "left" else green
+        if pair_key not in paired_colors:
+            # Reserva um par completo para que os lados mantenham a mesma família de tons.
+            reserved_indexes = set(paired_colors.values())
+            pair_index = next(
+                (
+                    index
+                    for index, (blue, green) in enumerate(BILATERAL_COLOR_PAIRS)
+                    if index not in reserved_indexes
+                    and blue not in used_colors
+                    and green not in used_colors
+                ),
+                len(BILATERAL_COLOR_PAIRS) + len(paired_colors),
+            )
+            paired_colors[pair_key] = pair_index
+        pair_index = paired_colors[pair_key]
+        if pair_index < len(BILATERAL_COLOR_PAIRS):
+            blue, green = BILATERAL_COLOR_PAIRS[pair_index]
+        else:
+            fallback_index = pair_index - len(BILATERAL_COLOR_PAIRS)
+            blue = (
+                0,
+                65 + (fallback_index * 7) % 100,
+                150 + (fallback_index * 13) % 106,
+            )
+            green = (
+                0,
+                120 + (fallback_index * 11) % 136,
+                20 + (fallback_index * 17) % 100,
+            )
+        return blue if laterality == "left" else green
 
     for anatomy_key, color in ANATOMICAL_COLORS.items():
-        if anatomy_key in key or anatomy_key in normalize_name(display_name):
+        if anatomy_key in normalized_key or anatomy_key in normalized_display:
             if color not in used_colors:
                 return color
 
@@ -792,8 +1029,7 @@ def choose_structure_color(
         if color not in used_colors:
             return color
 
-    # The palettes above provide enough colors for the expected RTSTRUCTs.
-    # This deterministic fallback keeps colors unique for unusually large sets.
+    # Mantém cores distintas mesmo quando há mais estruturas que cores previstas.
     candidate = tuple((37 * (len(used_colors) + channel + 1)) % 256 for channel in range(3))
     while candidate in used_colors:
         candidate = tuple((value + 17) % 256 for value in candidate)
@@ -818,11 +1054,11 @@ def estimate_colorectal_transition_z(
     roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]],
     colon_polys: List[Tuple[float, Polygon]],
 ) -> Tuple[float, str]:
-    """Estimate the rectosigmoid transition from the 3-D colon trajectory.
+    """Estima a transição retossigmoide pela trajetória tridimensional do cólon.
 
-    The transition is selected where the colon leaves the sacral midline and
-    develops a persistent lateral displacement or turn. Sacral structures are
-    used to define a patient-specific axis; z is used only to order slices.
+    A transição ocorre quando o cólon deixa a linha média sacral e apresenta
+    desvio lateral ou curvatura persistente. O eixo sacral é individualizado;
+    Z serve apenas para ordenar as fatias.
     """
     grouped_colon = polygons_group_by_z(colon_polys)
     trajectory = sorted(
@@ -878,8 +1114,7 @@ def estimate_colorectal_transition_z(
         )
         anchor_z = float(np.median(colon_z))
 
-    # Median smoothing suppresses isolated contour artifacts without changing
-    # the slice grid or the original contour geometry.
+    # A mediana reduz artefatos isolados sem alterar a geometria dos contornos.
     smoothed = []
     for index, (z, x, y) in enumerate(trajectory):
         window = trajectory[max(0, index - 2):min(len(trajectory), index + 3)]
@@ -904,8 +1139,7 @@ def estimate_colorectal_transition_z(
             cosine = float(np.dot(before, after) / (before_norm * after_norm))
             turns[index] = math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
 
-    # Require the lateral/curvature change to persist for at least three
-    # slices, avoiding classification of isolated sigmoid loops as transition.
+    # Exige persistência por três fatias para não confundir alças isoladas com a transição.
     candidates = []
     for index in range(1, len(smoothed) - 2):
         persistent = all(
@@ -929,9 +1163,8 @@ def estimate_colorectal_transition_z(
 def estimate_sigmoid_cranial_limit_z(
     roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]],
     colon_polys: List[Tuple[float, Polygon]],
-    margin_mm: float = 10.0,
 ) -> Tuple[float, str]:
-    """Use the last cranial sacral slice as the sigmoid cranial limit."""
+    """Usa a última fatia sacral cranial como limite do sigmoide."""
     for key in ("sacro", "sacrum"):
         if key not in roi_polygons:
             continue
@@ -1007,6 +1240,17 @@ def get_roi_display_color(roi_contour: Optional[Dataset],
         return fallback
     return (int(color[0]), int(color[1]), int(color[2]))
 
+def copy_roi_contour_for_export(
+    roi_contour: Dataset,
+    roi_number: int,
+    color: Tuple[int, int, int],
+) -> Dataset:
+    # Preserva os contornos originais; apenas atualiza a referência e a cor.
+    exported = copy.deepcopy(roi_contour)
+    exported.ReferencedROINumber = int(roi_number)
+    exported.ROIDisplayColor = [int(channel) for channel in color]
+    return exported
+
 def lighten_color(color: Tuple[int, int, int], amount: float = 0.45) -> Tuple[int, int, int]:
     amount = min(max(amount, 0.0), 1.0)
     return tuple(
@@ -1052,7 +1296,7 @@ def parse_args():
     p.add_argument("inputs", nargs="*", help="arquivos RTSTRUCT DICOM")
     args = p.parse_args()
     if not args.inputs:
-        print("Uso mínimo: python unir_rtstructs_xio_full.py -o saida.dcm arquivo1.dcm arquivo2.dcm")
+        print("Uso: python unir_rtstructs.py -o saida.dcm arquivo1.dcm arquivo2.dcm")
         sys.exit(1)
     out = args.output or "Grupo_unido_pulmoes_xio_full.dcm"
     return args.inputs, out, args.debug
@@ -1110,21 +1354,21 @@ def main():
                 lst.extend([(z, poly) for (z, poly, *rest) in roi_polygons[k]])
         return lst
 
-    # Step 1: dilatar lobos originais por 3 mm (margem)
+    # Fecha pequenas falhas nas bordas dos lobos sem alterar o volume final.
     left_lobes_polys = collect_polygons_for_keys(left_lobe_keys)
     right_lobes_polys = collect_polygons_for_keys(right_lobe_keys)
 
     dilated_left = dilate_by_margin(left_lobes_polys, margin_mm=3.0) if left_lobes_polys else {}
     dilated_right = dilate_by_margin(right_lobes_polys, margin_mm=3.0) if right_lobes_polys else {}
 
-    # Step 2 & 3: unir por lado e erodir 3 mm -> pulmao_E / pulmao_D
+    # A erosão após a união remove apenas a expansão temporária da etapa anterior.
     eroded_left = erode_grouped_by_margin(dilated_left, margin_mm=3.0) if dilated_left else {}
     eroded_right = erode_grouped_by_margin(dilated_right, margin_mm=3.0) if dilated_right else {}
 
-    created_items = OrderedDict()
+    created_items = {}
 
-    # tentar obter ContourImageSequence de amostras para preservar referências de fatia
-    def find_sample_roi_contour_for_keys(keys):
+    # Recupera a referência de imagem original para preservar o vínculo com as fatias.
+    def find_sample_roi_contour_for_keys(keys: List[str]) -> Optional[Dataset]:
         for k in keys:
             if k in roi_map_all and roi_map_all[k]["samples"]:
                 s_ds, s_num, _ = roi_map_all[k]["samples"][0]
@@ -1153,15 +1397,25 @@ def main():
             "sample_roi_contour": sample_right
         }
 
-    # Step 4: pulmoes = união(pulmao_E, pulmao_D)
-    all_eroded = []
-    sample_for_pulmoes = None
-    if "pulmao_E" in created_items:
-        all_eroded.extend([(z, poly) for (z, poly) in created_items["pulmao_E"]["grouped"].items()])
-        sample_for_pulmoes = sample_for_pulmoes or created_items["pulmao_E"].get("sample_roi_contour")
-    if "pulmao_D" in created_items:
-        all_eroded.extend([(z, poly) for (z, poly) in created_items["pulmao_D"]["grouped"].items()])
-        sample_for_pulmoes = sample_for_pulmoes or created_items["pulmao_D"].get("sample_roi_contour")
+    # Gera também a união bilateral para facilitar a visualização conjunta.
+    lung_items = [
+        created_items[name]
+        for name in ("pulmao_E", "pulmao_D")
+        if name in created_items
+    ]
+    all_eroded = [
+        (z, poly)
+        for item in lung_items
+        for z, poly in item["grouped"].items()
+    ]
+    sample_for_pulmoes = next(
+        (
+            item["sample_roi_contour"]
+            for item in lung_items
+            if item.get("sample_roi_contour") is not None
+        ),
+        None,
+    )
     if all_eroded:
         grouped_combined = polygons_group_by_z(all_eroded)
         created_items["pulmoes"] = {
@@ -1171,7 +1425,7 @@ def main():
             "sample_roi_contour": sample_for_pulmoes
         }
 
-    # medula_PRV (spinal_cord buffer 3mm) - criado explicitamente
+    # Cria a margem de planejamento ao redor da medula sem alterar a ROI original.
     if "spinal_cord" in roi_polygons:
         spinal_polys = [(z, poly) for (z, poly, *rest) in roi_polygons["spinal_cord"]]
         grouped_spinal = polygons_group_by_z(spinal_polys)
@@ -1184,20 +1438,51 @@ def main():
                 continue
             buffered[z] = buf
         if buffered:
-            sample_spinal = None
-            if roi_map_all.get("spinal_cord", {}).get("samples"):
-                s_ds, s_num, _ = roi_map_all["spinal_cord"]["samples"][0]
-                if hasattr(s_ds, "ROIContourSequence"):
-                    for rc in s_ds.ROIContourSequence:
-                        if getattr(rc, "ReferencedROINumber", None) == s_num:
-                            sample_spinal = rc
-                            break
             created_items["medula_PRV"] = {
                 "grouped": buffered,
                 "color": COLOR_MEDULA_PRV,
                 "label": "medula_PRV",
-                "sample_roi_contour": sample_spinal
+                "sample_roi_contour": find_sample_roi_contour_for_keys(
+                    ["spinal_cord"]
+                )
             }
+
+    brainstem_polys = [
+        (z, poly) for z, poly, *rest in roi_polygons.get("brainstem", [])
+    ]
+    capsule_polys = [
+        (z, poly) for z, poly, *rest in roi_polygons.get("internal_capsule", [])
+    ]
+    spinal_polys = [
+        (z, poly) for z, poly, *rest in roi_polygons.get("spinal_cord", [])
+    ]
+    grouped_tronco = build_tronco_grouped(
+        brainstem_polys,
+        capsule_polys,
+        spinal_polys,
+    )
+    if grouped_tronco:
+        created_items["tronco"] = {
+            "grouped": grouped_tronco,
+            "color": COLOR_TRONCO,
+            "label": "tronco",
+            "sample_roi_contour": find_sample_roi_contour_for_keys(["brainstem"]),
+        }
+    else:
+        missing_sources = [
+            source
+            for source, polygons in (
+                ("brainstem", brainstem_polys),
+                ("internal_capsule", capsule_polys),
+            )
+            if not polygons
+        ]
+        reason = (
+            "ausência de " + " e ".join(missing_sources)
+            if missing_sources
+            else "não há componente caudal contínuo conectado à medula"
+        )
+        print(f"Aviso: não foi possível criar tronco: {reason}.")
 
     # Avaliação das mamas: interseção com o corpo erodido em 4 mm.
     # O corpo erodido é mantido somente em memória e não é exportado.
@@ -1250,16 +1535,13 @@ def main():
         created_items[evaluation_name] = {
             "grouped": evaluated_breast,
             "color": lighten_color(
-                get_roi_display_color(
-                    sample_breast,
-                    COLOR_MAMA_D if breast_key == "breast_right" else COLOR_MAMA_E,
-                )
+                COLOR_MAMA_D if breast_key == "breast_right" else COLOR_MAMA_E
             ),
             "label": evaluation_name,
             "sample_roi_contour": sample_breast
         }
 
-    # Separação anatômico-geométrica do cólon em reto e sigmoide.
+    # Separa reto e sigmoide pela trajetória anatômica, sem dividir por proporção fixa.
     if "colon" in roi_polygons:
         colon_polys = [(z, poly) for (z, poly, *rest) in roi_polygons["colon"]]
         grouped_colon = polygons_group_by_z(colon_polys)
@@ -1271,7 +1553,6 @@ def main():
         cranial_limit_z, cranial_limit_source = estimate_sigmoid_cranial_limit_z(
             roi_polygons,
             colon_polys,
-            margin_mm=10.0,
         )
         rectum_grouped = {
             z: poly for z, poly in tracked_colon.items()
@@ -1311,28 +1592,22 @@ def main():
                 f"componentes_rastreados={len(tracked_colon)}."
             )
 
-    # costelas: unir todas as costelas em "costelas" (mantido)
-    rib_keys = [k for k in roi_polygons.keys() if k.startswith("rib_") or k.startswith("rib_left_") or k.startswith("rib_right_") or "costela" in k]
+    rib_keys = [
+        key for key in roi_polygons
+        if key.startswith("rib_") or "costela" in key
+    ]
     if rib_keys:
         all_ribs = []
-        sample_rib_roi_contour = None
         for k in rib_keys:
             entries = roi_polygons.get(k, [])
             all_ribs.extend([(z, poly) for (z, poly, *rest) in entries])
-            if sample_rib_roi_contour is None and roi_map_all.get(k, {}).get("samples"):
-                s_ds, s_num, _ = roi_map_all[k]["samples"][0]
-                if hasattr(s_ds, "ROIContourSequence"):
-                    for rc in s_ds.ROIContourSequence:
-                        if getattr(rc, "ReferencedROINumber", None) == s_num:
-                            sample_rib_roi_contour = rc
-                            break
         grouped_ribs = polygons_group_by_z(all_ribs) if all_ribs else {}
         if grouped_ribs:
             created_items["costelas"] = {
                 "grouped": grouped_ribs,
                 "color": COLOR_COSTELAS,
                 "label": "costelas",
-                "sample_roi_contour": sample_rib_roi_contour
+                "sample_roi_contour": find_sample_roi_contour_for_keys(rib_keys)
             }
 
     # ---------------------------
@@ -1382,6 +1657,8 @@ def main():
         final_order.append(("orig", "spinal_cord", None))
     if "medula_PRV" in created_items:
         final_order.append(("created", "medula_PRV", None))
+    if "tronco" in created_items:
+        final_order.append(("created", "tronco", None))
 
     # 6. fígado e vesícula próximos
     if "liver" in roi_map_all:
@@ -1422,26 +1699,27 @@ def main():
         if k in lobes_to_exclude:
             continue
         rep = list(roi_map_all[k]["original_names"])[0]
-        if key not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
+        if k not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
             continue
         remaining.append(k)
     remaining_sorted = sorted(remaining, key=lambda x: translated_map.get(x, x))
     for k in remaining_sorted:
         final_order.append(("orig", k, None))
 
-    muscle_keys_removed = {
-        key for key, entry in roi_map_all.items()
-        if is_muscle_roi(key, entry.get("original_names"))
+    original_keys_removed = {
+        key
+        for key, entry in roi_map_all.items()
+        if not should_export_original_roi(key, entry.get("original_names"))
     }
-    if muscle_keys_removed:
+    if original_keys_removed:
         final_order = [
             item for item in final_order
-            if not (item[0] == "orig" and item[1] in muscle_keys_removed)
+            if not (item[0] == "orig" and item[1] in original_keys_removed)
         ]
         if debug:
             print(
-                "Estruturas musculares removidas:",
-                sorted(muscle_keys_removed),
+                "Estruturas removidas pelas regras de exportação:",
+                sorted(original_keys_removed),
             )
 
     # ---------------------------
@@ -1454,12 +1732,12 @@ def main():
     roi_number_map: Dict[Tuple[str, str], int] = {}
     next_roi_number = 1
 
-    # First pass: assign numbers
+    # Numera as ROIs na ordem em que serão exportadas.
     for typ, key, region in final_order:
         roi_number_map[(typ, key)] = next_roi_number
         next_roi_number += 1
 
-    # Helper para adicionar StructureSetROISequence e RTROIObservationsSequence
+    # Mantém sincronizadas as sequências de estruturas e observações do DICOM.
     def add_structure_and_obs(number: int, name: str, generation: str = "MANUAL", interpreted_type: Optional[str] = None):
         s_item = Dataset()
         s_item.ROINumber = int(number)
@@ -1482,7 +1760,7 @@ def main():
             obs.RTROIInterpretedType = "ORGAN"
         ds_base.RTROIObservationsSequence.append(obs)
 
-    # Second pass: criar StructureSetROISequence entries (com nomes traduzidos)
+    # Cria os registros de estrutura com os nomes traduzidos.
     for typ, key, region in final_order:
         number = roi_number_map[(typ, key)]
         if typ == "created":
@@ -1518,7 +1796,7 @@ def main():
         for item in created_items.values()
         if item.get("color") is not None
     }
-    side_indexes = {"left": 0, "right": 0}
+    paired_colors: Dict[str, int] = {}
     for typ, key, region in final_order:
         if typ != "orig":
             continue
@@ -1537,7 +1815,6 @@ def main():
             display_name = "mama_E"
         else:
             display_name = translated
-        source_color = None
         sample = entry["samples"][0] if entry["samples"] else None
         if sample is None:
             continue
@@ -1546,14 +1823,8 @@ def main():
             for roi_contour in src_ds.ROIContourSequence:
                 if getattr(roi_contour, "ReferencedROINumber", None) != src_num:
                     continue
-                new_roi_contour = copy.deepcopy(roi_contour)
-                new_roi_contour.ReferencedROINumber = roi_number_map.get((typ, key))
                 if key in ("breast_right", "breast_left"):
-                    source_color = get_roi_display_color(
-                        roi_contour,
-                        COLOR_MAMA_D if key == "breast_right" else COLOR_MAMA_E,
-                    )
-                    color = source_color
+                    color = COLOR_MAMA_D if key == "breast_right" else COLOR_MAMA_E
                 elif key == "corpo":
                     color = get_roi_display_color(
                         roi_contour,
@@ -1564,9 +1835,13 @@ def main():
                         key,
                         display_name,
                         used_colors,
-                        side_indexes,
+                        paired_colors,
                     )
-                new_roi_contour.ROIDisplayColor = [int(channel) for channel in color]
+                new_roi_contour = copy_roi_contour_for_export(
+                    roi_contour,
+                    roi_number_map[(typ, key)],
+                    color,
+                )
                 used_colors.add(color)
                 if hasattr(new_roi_contour, "ContourSequence"):
                     valid_contours = []
@@ -1577,7 +1852,7 @@ def main():
                         new_roi_contour.ContourSequence = valid_contours
                         ds_base.ROIContourSequence.append(new_roi_contour)
 
-    # Adicionar criados (mama_D_aval, pulmao_E, pulmao_D, pulmoes, medula_PRV, costelas)
+    # Adicionar ROIs criadas (avaliações, pulmões, medula_PRV, tronco, costelas)
     for typ, key, region in final_order:
         if typ != "created":
             continue
