@@ -21,9 +21,9 @@ FINAL_SMOOTH_SIGMA = 0.6   # suavização final antes do threshold
 # ------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python BreastSplitLR_forceLR.py <dicom_series_path> <rt_struct_path>")
-        sys.exit(1)
+    if len(sys.argv) != 3:
+        print("Uso: python BreastSplit.py <dicom_series_path> <rt_struct_path>", file=sys.stderr)
+        sys.exit(2)
 
     dicom_series_path = sys.argv[1]
     rt_struct_path = sys.argv[2]
@@ -37,9 +37,13 @@ def main():
     mask = rtstruct.get_roi_mask_by_name("breast")
     if mask is None:
         raise RuntimeError("Máscara 'breast' não encontrada no RTSTRUCT.")
-    mask = np.asarray(mask).astype(bool)  # shape: (slices, rows, cols)
+    mask = np.asarray(mask).astype(bool)
+    if mask.ndim != 3:
+        raise ValueError(f"Máscara 'breast' deve ser 3D; shape recebido: {mask.shape}.")
+    if not mask.any():
+        raise RuntimeError("Máscara 'breast' está vazia.")
 
-    # Pré-processamento: suavizar e binarizar para reduzir ruído (mantendo bool)
+    # rt-utils representa volumes como (linhas, colunas, cortes).
     mask_smooth = gaussian_filter(mask.astype(float), sigma=SMOOTH_SIGMA) > 0.5
 
     # Labeling 3D para encontrar componentes conectados
@@ -49,11 +53,11 @@ def main():
     # Coletar componentes válidas (tamanho e centroides em X)
     components = []
     for lab in range(1, ncomp + 1):
-        coords = np.where(labeled == lab)  # tuple (z, y, x)
+        coords = np.where(labeled == lab)  # tuple (linha, coluna, corte)
         count = coords[0].size
         if count < MIN_COMPONENT_VOXELS:
             continue
-        centroid_x = coords[2].mean()  # média do índice X (coluna)
+        centroid_x = coords[1].mean()  # média do índice X (coluna)
         components.append({
             "label": lab,
             "count": int(count),
@@ -71,32 +75,31 @@ def main():
         components.append({
             "label": 1,
             "count": int(coords_all[0].size),
-            "centroid_x": float(coords_all[2].mean()),
+            "centroid_x": float(coords_all[1].mean()),
             "coords": coords_all
         })
 
     # Calcular centro geométrico X do volume (para forçar esquerda/direita)
     coords_all = np.where(mask)
-    min_x, max_x = int(coords_all[2].min()), int(coords_all[2].max())
+    min_x, max_x = int(coords_all[1].min()), int(coords_all[1].max())
     mid_x = (min_x + max_x) / 2.0  # ponto médio (float)
 
     # Criar máscaras vazias (boolean)
     mask_left = np.zeros_like(mask, dtype=bool)
     mask_right = np.zeros_like(mask, dtype=bool)
 
-    # Atribuir cada componente ao lado esquerdo ou direito com base no centroid_x vs mid_x
+    # Atribuir cada componente pelo eixo X das colunas.
     for comp in components:
         if comp["centroid_x"] < mid_x:
             mask_left[comp["coords"]] = True
         else:
             mask_right[comp["coords"]] = True
 
-    # Se algum dos lados ficou vazio, fazer split por índice X (garante sempre L e R)
+    # Se um lado ficou vazio, dividir no eixo X das colunas.
     if not mask_left.any() or not mask_right.any():
-        # dividir por índice inteiro (metade entre min_x e max_x)
         mid_idx = int((min_x + max_x) // 2)
-        mask_left[:, :, :mid_idx+1] = mask[:, :, :mid_idx+1]
-        mask_right[:, :, mid_idx+1:] = mask[:, :, mid_idx+1:]
+        mask_left[:, :mid_idx + 1, :] = mask[:, :mid_idx + 1, :]
+        mask_right[:, mid_idx + 1:, :] = mask[:, mid_idx + 1:, :]
 
     # Pós-processamento morfológico para limpar e preencher buracos
     for _ in range(MORPH_ITER):
@@ -112,27 +115,29 @@ def main():
             c = np.where(mask_bool)
             if c[0].size == 0:
                 return None
-            return c[2].mean()
+            return c[1].mean()
         cx_left = centroid_x_of(mask_left)
         cx_right = centroid_x_of(mask_right)
         ov_coords = np.where(overlap)
-        for z, y, x in zip(*ov_coords):
+        for row, column, slice_index in zip(*ov_coords):
             if cx_left is None:
-                mask_right[z, y, x] = True
-                mask_left[z, y, x] = False
+                mask_right[row, column, slice_index] = True
+                mask_left[row, column, slice_index] = False
                 continue
             if cx_right is None:
-                mask_left[z, y, x] = True
-                mask_right[z, y, x] = False
+                mask_left[row, column, slice_index] = True
+                mask_right[row, column, slice_index] = False
                 continue
-            if abs(x - cx_left) <= abs(x - cx_right):
-                mask_right[z, y, x] = False
+            if abs(column - cx_left) <= abs(column - cx_right):
+                mask_right[row, column, slice_index] = False
             else:
-                mask_left[z, y, x] = False
+                mask_left[row, column, slice_index] = False
 
     # Suavização final e threshold (mantendo boolean)
     mask_left = gaussian_filter(mask_left.astype(float), sigma=FINAL_SMOOTH_SIGMA) > 0.5
     mask_right = gaussian_filter(mask_right.astype(float), sigma=FINAL_SMOOTH_SIGMA) > 0.5
+    if not mask_left.any() or not mask_right.any():
+        raise RuntimeError("A separação não gerou máscaras para os dois lados.")
 
     # Garantir dtype boolean antes de adicionar ao RTStruct (requisito do rt_utils)
     mask_left = mask_left.astype(bool)
@@ -141,7 +146,7 @@ def main():
     # Debug prints
     print("Voxels originais na máscara:", int(mask.sum()))
     print("Voxels esquerda:", int(mask_left.sum()), "Voxels direita:", int(mask_right.sum()))
-    print("mid_x (float):", mid_x, "min_x:", min_x, "max_x:", max_x)
+    print("mid_x (colunas):", mid_x, "min_x:", min_x, "max_x:", max_x)
 
     # Adicionar novas estruturas ao RTSTRUCT (dtype bool exigido pelo rt_utils)
     # Lembrando que o nome "Breast_right" é para a máscara do lado esquerdo da imagem (que corresponde à mama direita do paciente) e vice-versa

@@ -29,6 +29,8 @@ def hex_to_rgb(hex_color: str) -> list[int]:
 
 def _slice_spacing_mm(series_data: list) -> float:
     """Obtém a distância física entre cortes ordenados."""
+    if not series_data:
+        raise ValueError("A série DICOM não contém imagens.")
     if len(series_data) < 2:
         return float(getattr(series_data[0], "SliceThickness", 1.0))
 
@@ -49,6 +51,8 @@ def _slice_spacing_mm(series_data: list) -> float:
 
 
 def _voxel_spacing_mm(series_data: list) -> tuple[float, float, float]:
+    if not series_data:
+        raise ValueError("A série DICOM não contém imagens.")
     pixel_spacing = np.asarray(series_data[0].PixelSpacing, dtype=float)
     if pixel_spacing.shape != (2,) or np.any(pixel_spacing <= 0):
         raise ValueError("PixelSpacing inválido na série DICOM.")
@@ -95,6 +99,10 @@ def _get_roi_number(rtstruct, name: str):
 
 
 def _valid_contour(contour) -> bool:
+    if getattr(contour, "ContourGeometricType", "") not in {
+        "CLOSED_PLANAR", "CLOSEDPLANAR_XOR"
+    }:
+        return False
     try:
         data = np.asarray(getattr(contour, "ContourData", []), dtype=float)
         point_count = int(
@@ -104,7 +112,7 @@ def _valid_contour(contour) -> bool:
         return False
     if data.size < 9 or data.size % 3 != 0 or not np.isfinite(data).all():
         return False
-    if point_count < 3:
+    if point_count < 3 or point_count != data.size // 3:
         return False
     if not hasattr(contour, "ContourImageSequence") or not contour.ContourImageSequence:
         return False
@@ -114,34 +122,61 @@ def _valid_contour(contour) -> bool:
 
 def _mask_for_roi(rtstruct, name: str) -> np.ndarray:
     roi_number = _get_roi_number(rtstruct, name)
-    contour_sequence = []
-    for roi_contour in rtstruct.ds.ROIContourSequence:
-        if str(getattr(roi_contour, "ReferencedROINumber", "")) == str(roi_number):
-            contour_sequence = list(getattr(roi_contour, "ContourSequence", []))
-            break
+    contour_sequence = [
+        contour
+        for roi_contour in getattr(rtstruct.ds, "ROIContourSequence", [])
+        if str(getattr(roi_contour, "ReferencedROINumber", "")) == str(roi_number)
+        for contour in getattr(roi_contour, "ContourSequence", [])
+    ]
 
-    valid_contours = [contour for contour in contour_sequence
-                      if _valid_contour(contour)]
+    closed_contours = [
+        contour for contour in contour_sequence
+        if getattr(contour, "ContourGeometricType", "") in {
+            "CLOSED_PLANAR", "CLOSEDPLANAR_XOR"
+        }
+    ]
+    valid_contours = [contour for contour in closed_contours if _valid_contour(contour)]
+    invalid_count = len(closed_contours) - len(valid_contours)
+    if invalid_count:
+        print(
+            f"Aviso: {invalid_count} contorno(s) inválido(s) ignorado(s) "
+            f"na ROI '{name}'.",
+            file=sys.stderr,
+        )
     if not valid_contours:
         raise ValueError("não há contornos fechados válidos")
 
+    geometric_types = {
+        getattr(contour, "ContourGeometricType", "")
+        for contour in valid_contours
+    }
+    if len(geometric_types) > 1:
+        raise ValueError("a ROI mistura contornos CLOSED_PLANAR e CLOSEDPLANAR_XOR")
+    xor_contours = geometric_types == {"CLOSEDPLANAR_XOR"}
     combined = None
-    skipped = 0
+    failed = []
     for contour in valid_contours:
         try:
             contour_mask = image_helper.create_series_mask_from_contour_sequence(
                 rtstruct.series_data, [contour]
             )
         except (cv2.error, ValueError, IndexError, KeyError, AttributeError,
-                TypeError):
-            skipped += 1
+                TypeError) as error:
+            failed.append(str(error))
             continue
-        combined = (contour_mask if combined is None
-                    else np.logical_or(combined, contour_mask))
+        if combined is not None and contour_mask.shape != combined.shape:
+            raise ValueError("contornos da ROI produziram máscaras com dimensões diferentes")
+        if combined is None:
+            combined = contour_mask
+        elif xor_contours:
+            combined = np.logical_xor(combined, contour_mask)
+        else:
+            combined = np.logical_or(combined, contour_mask)
 
-    if skipped:
+    if failed:
         print(
-            f"Aviso: {skipped} contorno(s) inválido(s) ignorado(s) na ROI '{name}'.",
+            f"Aviso: {len(failed)} contorno(s) não puderam ser rasterizados "
+            f"na ROI '{name}' e foram ignorados: " + "; ".join(failed),
             file=sys.stderr,
         )
     if combined is None or not combined.any():
@@ -152,12 +187,28 @@ def _mask_for_roi(rtstruct, name: str) -> np.ndarray:
 def _build_body_mask(rtstruct, spacing: tuple[float, float, float]) -> np.ndarray:
     masks = []
     for name in _iter_roi_names(rtstruct):
+        roi_number = _get_roi_number(rtstruct, name)
+        has_contours = any(
+            str(getattr(roi_contour, "ReferencedROINumber", "")) == str(roi_number)
+            and any(
+                getattr(contour, "ContourGeometricType", "") in {
+                    "CLOSED_PLANAR", "CLOSEDPLANAR_XOR"
+                }
+                for contour in getattr(roi_contour, "ContourSequence", [])
+            )
+            for roi_contour in getattr(rtstruct.ds, "ROIContourSequence", [])
+        )
+        if not has_contours:
+            continue
         try:
             roi_mask = _mask_for_roi(rtstruct, name)
         except (RTStruct.ROIException, ValueError, IndexError, KeyError,
                 AttributeError, TypeError) as error:
-            print(f"Aviso: não foi possível rasterizar '{name}': {error}",
-                  file=sys.stderr)
+            print(
+                f"Aviso: não foi possível rasterizar a ROI '{name}'; "
+                f"ela será ignorada: {error}",
+                file=sys.stderr,
+            )
             continue
         if roi_mask.any():
             masks.append(roi_mask)

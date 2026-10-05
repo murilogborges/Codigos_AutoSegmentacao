@@ -54,8 +54,8 @@ if rtstruct_paths:
 
     # Salvar novo arquivo combinado (ainda apenas o primeiro como base)
     if ds_base is not None:
-        ds_base.save_as("GrupoMama.dcm")
-        texto.insert(END, "\nNovo arquivo salvo como GrupoMama.dcm\n")
+        ds_base.save_as("GrupoMAMA.dcm")
+        texto.insert(END, "\nNovo arquivo salvo como GrupoMAMA.dcm\n")
 
     janela.mainloop()
 else:

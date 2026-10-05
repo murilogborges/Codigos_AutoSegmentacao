@@ -11,7 +11,7 @@ import argparse
 import copy
 import math
 import os
-import sys
+import re
 import unicodedata
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -72,6 +72,7 @@ TRADUCAO = {
 
 # coração
 "heart":"coracao",
+"cardiac_area":"area_cardiaca",
 "heart_myocardium":"miocardio",
 "heart_atrium_left":"atri_E",
 "heart_atrium_right":"atri_D",
@@ -438,7 +439,7 @@ COLOR_PULMAO_D = (0, 100, 20)
 COLOR_PULMOES = (135, 206, 250)
 COLOR_MEDULA_PRV = (255, 165, 0)
 COLOR_COSTELAS = (220, 220, 220)
-COLOR_CARDIAC_AREA = (188, 92, 104)
+COLOR_CARDIAC_AREA = (255, 35, 75)
 COLOR_TRONCO = (0, 95, 105)
 COLOR_MAMA_D = (140, 70, 190)
 COLOR_MAMA_E = (220, 90, 160)
@@ -630,6 +631,133 @@ def vertebra_display_name(translated: str) -> str:
         return translated.replace("vertebra", "").strip("_")
     return translated
 
+def is_vertebral_roi(key: str) -> bool:
+    normalized = normalize_name(key)
+    return (
+        normalized.startswith(("vertebrae_", "vertebra_"))
+        or normalized in {"vertebrae", "sacro", "sacrum", "intervertebral_discs"}
+    )
+
+def vertebral_order_key(key: str) -> Tuple[int, int, str]:
+    normalized = normalize_name(key)
+    match = re.match(r"^vertebrae?_([ctls])(\d+)$", normalized)
+    if match:
+        region_order = {"c": 0, "t": 1, "l": 2, "s": 3}[match.group(1)]
+        return region_order, int(match.group(2)), normalized
+    if normalized in {"sacro", "sacrum"}:
+        return 3, 99, normalized
+    return 4, 0, normalized
+
+def reorder_rois_craniocaudal(
+    final_order: List[Tuple[str, str, Optional[str]]],
+    roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]],
+    created_items: Dict[str, Dict],
+    roi_map_all: Dict[str, Dict],
+) -> List[Tuple[str, str, Optional[str]]]:
+    if not final_order:
+        return final_order
+
+    body_items = [
+        item for item in final_order
+        if item[0] == "orig" and normalize_name(item[1]) == "corpo"
+    ]
+    preferred_keys = (
+        ("orig", "breast_right"),
+        ("orig", "breast_left"),
+        ("created", "mama_D_aval"),
+        ("created", "mama_E_aval"),
+        ("created", "pulmao_D"),
+        ("created", "pulmao_E"),
+        ("created", "pulmoes"),
+        ("orig", "cardiac_area"),
+    )
+    preferred_items = []
+    preferred_ids = set()
+    items_by_id = {(item[0], item[1]): item for item in final_order}
+    for item_id in preferred_keys:
+        item = items_by_id.get(item_id)
+        if item is not None:
+            preferred_items.append(item)
+            preferred_ids.add(item_id)
+
+    other_items = []
+    vertebral_items = []
+    for item in final_order:
+        item_id = (item[0], item[1])
+        if item in body_items or item_id in preferred_ids:
+            continue
+        typ, key, _ = item
+        if typ == "orig" and is_vertebral_roi(key):
+            vertebral_items.append(item)
+        else:
+            other_items.append(item)
+
+    def superior_position(item: Tuple[str, str, Optional[str]]) -> float:
+        typ, key, _ = item
+        if typ == "orig":
+            positions = [float(sample[0]) for sample in roi_polygons.get(key, [])]
+        else:
+            positions = [
+                float(position)
+                for position in created_items.get(key, {}).get("grouped", {})
+            ]
+        return sum(positions) / len(positions) if positions else float("-inf")
+
+    pairs: Dict[str, Dict[str, Tuple[str, str, Optional[str]]]] = {}
+    for item in other_items:
+        typ, key, _ = item
+        if typ != "orig":
+            continue
+        display_name = translate_name(
+            representative_roi_name(roi_map_all[key], key)
+        ) if key in roi_map_all else key
+        pair_key = structure_pair_key(key, display_name)
+        laterality = structure_laterality(key, display_name)
+        if pair_key and laterality:
+            pairs.setdefault(pair_key, {})[laterality] = item
+
+    paired_items = {
+        item
+        for sides in pairs.values()
+        if "left" in sides and "right" in sides
+        for item in sides.values()
+    }
+    paired_groups = []
+    consumed_pairs = set()
+    singles = []
+    for item in other_items:
+        typ, key, _ = item
+        pair_key = None
+        if typ == "orig":
+            display_name = translate_name(
+                representative_roi_name(roi_map_all[key], key)
+            ) if key in roi_map_all else key
+            pair_key = structure_pair_key(key, display_name)
+        if pair_key in pairs and pair_key not in consumed_pairs:
+            sides = pairs[pair_key]
+            if "left" in sides and "right" in sides:
+                pair = (sides["right"], sides["left"])
+                paired_groups.append(
+                    (
+                        sum(superior_position(member) for member in pair) / 2,
+                        pair,
+                    )
+                )
+                consumed_pairs.add(pair_key)
+                continue
+        if item not in paired_items:
+            singles.append(item)
+
+    ordered_units = [
+        (superior_position(item), (item,))
+        for item in singles
+    ]
+    ordered_units.extend(paired_groups)
+    ordered_units.sort(key=lambda unit: unit[0], reverse=True)
+    other_items = [item for _, group in ordered_units for item in group]
+    vertebral_items.sort(key=lambda item: vertebral_order_key(item[1]))
+    return body_items + preferred_items + other_items + vertebral_items
+
 # ---------------------------
 # Geometria: conversões
 # ---------------------------
@@ -637,44 +765,58 @@ def contour_points_from_ds(contour_ds: Dataset) -> List[Tuple[float, float, floa
     data = getattr(contour_ds, "ContourData", None)
     if data is None:
         return []
-    pts = [float(x) for x in data]
+    try:
+        pts = [float(x) for x in data]
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Contorno DICOM contém coordenadas não numéricas.") from error
+    declared_count = getattr(contour_ds, "NumberOfContourPoints", len(pts) // 3)
+    if len(pts) < 9 or len(pts) % 3 != 0 or declared_count != len(pts) // 3:
+        raise ValueError("Contorno DICOM possui quantidade de pontos inválida.")
+    if not all(math.isfinite(value) for value in pts):
+        raise ValueError("Contorno DICOM contém coordenadas não finitas.")
+    if getattr(contour_ds, "ContourGeometricType", "") not in {
+        "CLOSED_PLANAR", "CLOSEDPLANAR_XOR"
+    }:
+        return []
     return [(pts[i], pts[i + 1], pts[i + 2]) for i in range(0, len(pts), 3)]
 
 def polygon_from_contour_points(pts: List[Tuple[float, float, float]]) -> Optional[Polygon]:
     if not pts:
         return None
     xy = [(p[0], p[1]) for p in pts]
-    try:
-        poly = Polygon(xy)
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        if poly.is_empty:
-            return None
-        return poly
-    except Exception:
+    poly = Polygon(xy)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty:
         return None
+    return poly
 
 def polygon_to_contour_sequence(poly: Polygon, z: float, n_points: int = 120) -> List[List[Tuple[float, float, float]]]:
     if poly is None or poly.is_empty:
         return []
-    exterior = poly.exterior
-    coords = list(exterior.coords)
-    if len(coords) < 4:
-        return []
-    ring = LinearRing(coords)
-    total = ring.length
-    if total == 0:
-        return []
-    samples = []
-    for i in range(n_points):
-        d = (i / float(n_points)) * total
-        pt = ring.interpolate(d)
-        samples.append((float(pt.x), float(pt.y), float(z)))
-    return [samples]
+    output = []
+    for boundary in (poly.exterior, *poly.interiors):
+        coords = list(boundary.coords)
+        if len(coords) < 4:
+            continue
+        ring = LinearRing(coords)
+        total = ring.length
+        if total == 0:
+            continue
+        samples = []
+        for i in range(n_points):
+            d = (i / float(n_points)) * total
+            pt = ring.interpolate(d)
+            samples.append((float(pt.x), float(pt.y), float(z)))
+        output.append(samples)
+    return output
 
-def create_contour_dataset_from_points(pts: List[Tuple[float, float, float]]) -> Dataset:
+def create_contour_dataset_from_points(
+    pts: List[Tuple[float, float, float]],
+    geometric_type: str = "CLOSED_PLANAR",
+) -> Dataset:
     item = Dataset()
-    item.ContourGeometricType = "CLOSED_PLANAR"
+    item.ContourGeometricType = geometric_type
     item.NumberOfContourPoints = len(pts)
     flat = []
     for (x, y, z) in pts:
@@ -699,7 +841,11 @@ def colon_components_by_z(
     for z, poly in colon_polys:
         if poly is None or poly.is_empty:
             continue
-        geometry = poly if isinstance(poly, Polygon) else unary_union(poly)
+        geometry = (
+            poly
+            if isinstance(poly, Polygon) or hasattr(poly, "geoms")
+            else unary_union(poly)
+        )
         geometries = (
             [geometry]
             if isinstance(geometry, Polygon)
@@ -838,13 +984,10 @@ def dilate_by_margin(polys_with_z: List[Tuple[float, Polygon]], margin_mm: float
     for z, poly in grouped.items():
         if poly is None:
             continue
-        try:
-            dilated = poly.buffer(margin_mm)
-            if dilated is None or dilated.is_empty:
-                continue
-            out[z] = dilated
-        except Exception:
+        dilated = poly.buffer(margin_mm)
+        if dilated is None or dilated.is_empty:
             continue
+        out[z] = dilated
     return out
 
 def erode_grouped_by_margin(grouped_by_z: Dict[float, Polygon], margin_mm: float = 3.0) -> Dict[float, Polygon]:
@@ -852,13 +995,10 @@ def erode_grouped_by_margin(grouped_by_z: Dict[float, Polygon], margin_mm: float
     for z, poly in grouped_by_z.items():
         if poly is None:
             continue
-        try:
-            eroded = poly.buffer(-margin_mm)
-            if eroded is None or eroded.is_empty:
-                continue
-            out[z] = eroded
-        except Exception:
+        eroded = poly.buffer(-margin_mm)
+        if eroded is None or eroded.is_empty:
             continue
+        out[z] = eroded
     return out
 
 def find_body_roi_key(roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]]) -> Optional[str]:
@@ -1194,18 +1334,29 @@ def collect_rois_from_ds(ds: Dataset) -> Dict[str, Dict]:
         roi_map[norm]["original_names"].add(name)
     return roi_map
 
+def has_structure_set_roi_sequence(ds: Dataset) -> bool:
+    return bool(getattr(ds, "StructureSetROISequence", None))
+
+def representative_roi_name(entry: Dict, fallback: str) -> str:
+    names = sorted(entry.get("original_names", ()))
+    return names[0] if names else fallback
+
 def build_polygons_for_roi_samples(entry_samples: List[Tuple[Dataset, int, Dataset]]) -> List[Tuple[float, Polygon, Dataset, int]]:
     polygons = []
     for (src_ds, src_num, roi_ds) in entry_samples:
         if not hasattr(src_ds, "ROIContourSequence"):
             continue
+        polygons_by_z = defaultdict(list)
         for roi_contour in src_ds.ROIContourSequence:
             if getattr(roi_contour, "ReferencedROINumber", None) != src_num:
                 continue
             if not hasattr(roi_contour, "ContourSequence"):
                 continue
             for contour in roi_contour.ContourSequence:
-                pts = contour_points_from_ds(contour)
+                try:
+                    pts = contour_points_from_ds(contour)
+                except ValueError:
+                    continue
                 if not pts:
                     continue
                 zs = [p[2] for p in pts]
@@ -1213,7 +1364,25 @@ def build_polygons_for_roi_samples(entry_samples: List[Tuple[Dataset, int, Datas
                 poly = polygon_from_contour_points(pts)
                 if poly is None:
                     continue
-                polygons.append((z, poly, src_ds, src_num))
+                geometric_type = getattr(contour, "ContourGeometricType", "")
+                polygons_by_z[round(z, 3)].append((poly, geometric_type))
+
+        for z, contours in polygons_by_z.items():
+            geometric_types = {geometric_type for _, geometric_type in contours}
+            if len(geometric_types) != 1:
+                raise ValueError(
+                    f"ROI {src_num} mistura tipos de contorno na fatia {z}."
+                )
+            if geometric_types == {"CLOSEDPLANAR_XOR"}:
+                geometry = contours[0][0]
+                for candidate, _ in contours[1:]:
+                    geometry = geometry.symmetric_difference(candidate)
+                if not geometry.is_empty:
+                    polygons.append((z, geometry, src_ds, src_num))
+            else:
+                polygons.extend(
+                    (z, poly, src_ds, src_num) for poly, _ in contours
+                )
     return polygons
 
 # ---------------------------
@@ -1265,6 +1434,7 @@ def create_roi_contour_item_from_grouped_polys(grouped_by_z: Dict[float, Polygon
     roi_contour = Dataset()
     roi_contour.ReferencedROINumber = int(new_number)
     contour_seq = []
+    polygons = []
     cis_template = copy_contour_image_sequence_from_sample(sample_roi_contour_for_images)
     for z in sorted(grouped_by_z.keys()):
         geom = grouped_by_z[z]
@@ -1274,12 +1444,21 @@ def create_roi_contour_item_from_grouped_polys(grouped_by_z: Dict[float, Polygon
         for g in geoms:
             if not isinstance(g, Polygon):
                 continue
-            contours_pts_list = polygon_to_contour_sequence(g, z, n_points=120)
-            for pts in contours_pts_list:
-                contour_item = create_contour_dataset_from_points(pts)
-                if cis_template:
-                    contour_item.ContourImageSequence = [copy.deepcopy(x) for x in cis_template]
-                contour_seq.append(contour_item)
+            polygons.append((g, z))
+    geometric_type = (
+        "CLOSEDPLANAR_XOR"
+        if any(poly.interiors for poly, _ in polygons)
+        else "CLOSED_PLANAR"
+    )
+    for poly, z in polygons:
+        for pts in polygon_to_contour_sequence(poly, z, n_points=120):
+            contour_item = create_contour_dataset_from_points(
+                pts,
+                geometric_type=geometric_type,
+            )
+            if cis_template:
+                contour_item.ContourImageSequence = [copy.deepcopy(x) for x in cis_template]
+            contour_seq.append(contour_item)
     if contour_seq:
         roi_contour.ContourSequence = contour_seq
     if color_rgb is not None:
@@ -1290,16 +1469,72 @@ def create_roi_contour_item_from_grouped_polys(grouped_by_z: Dict[float, Polygon
 # Parser de argumentos
 # ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser(add_help=False)
+    p = argparse.ArgumentParser(
+        description="Combina RTSTRUCTs compatíveis e gera estruturas derivadas."
+    )
     p.add_argument("-o", "--output", required=False, help="arquivo de saída (ex: /caminho/saida.dcm)")
     p.add_argument("--debug", action="store_true", help="imprime resumo de ROIs e contagens antes de salvar")
-    p.add_argument("inputs", nargs="*", help="arquivos RTSTRUCT DICOM")
+    p.add_argument("inputs", nargs="+", help="arquivos RTSTRUCT DICOM")
     args = p.parse_args()
-    if not args.inputs:
-        print("Uso: python unir_rtstructs.py -o saida.dcm arquivo1.dcm arquivo2.dcm")
-        sys.exit(1)
     out = args.output or "Grupo_unido_pulmoes_xio_full.dcm"
     return args.inputs, out, args.debug
+
+def referenced_frame_uids(ds: Dataset) -> set[str]:
+    frame_uids = {
+        str(getattr(item, "FrameOfReferenceUID", ""))
+        for item in getattr(ds, "ReferencedFrameOfReferenceSequence", [])
+        if getattr(item, "FrameOfReferenceUID", "")
+    }
+    if not frame_uids:
+        frame_uids = {
+            str(getattr(item, "ReferencedFrameOfReferenceUID", ""))
+            for item in getattr(ds, "StructureSetROISequence", [])
+            if getattr(item, "ReferencedFrameOfReferenceUID", "")
+        }
+    return frame_uids
+
+def referenced_series_uids(ds: Dataset) -> set[str]:
+    series_uids = set()
+    for frame in getattr(ds, "ReferencedFrameOfReferenceSequence", []):
+        for study in getattr(frame, "RTReferencedStudySequence", []):
+            for series in getattr(study, "RTReferencedSeriesSequence", []):
+                uid = getattr(series, "SeriesInstanceUID", "")
+                if uid:
+                    series_uids.add(str(uid))
+    return series_uids
+
+def validate_compatible_rtstructs(base: Dataset, candidate: Dataset, path: str) -> None:
+    if str(getattr(candidate, "SOPClassUID", "")) != RTSTRUCT_SOPCLASS:
+        raise ValueError(f"{path} não é um RTSTRUCT DICOM.")
+    if not getattr(candidate, "StructureSetROISequence", None):
+        raise ValueError(f"{path} não contém StructureSetROISequence.")
+    base_frames = referenced_frame_uids(base)
+    candidate_frames = referenced_frame_uids(candidate)
+    if len(base_frames) != 1 or len(candidate_frames) != 1:
+        raise ValueError(f"{path} não possui referência de Frame of Reference verificável.")
+    base_series = referenced_series_uids(base)
+    candidate_series = referenced_series_uids(candidate)
+    if len(base_series) != 1 or len(candidate_series) != 1:
+        raise ValueError(f"{path} não possui referência de série DICOM verificável.")
+
+    for attribute, label in (
+        ("PatientID", "PatientID"),
+        ("StudyInstanceUID", "StudyInstanceUID"),
+    ):
+        base_value = str(getattr(base, attribute, "")).strip()
+        candidate_value = str(getattr(candidate, attribute, "")).strip()
+        if base_value and candidate_value and base_value != candidate_value:
+            raise ValueError(f"{path} possui {label} diferente do primeiro RTSTRUCT.")
+
+    if base_frames != candidate_frames:
+        raise ValueError(
+            f"{path} não referencia o mesmo Frame of Reference do primeiro RTSTRUCT."
+        )
+
+    if base_series != candidate_series:
+        raise ValueError(
+            f"{path} não referencia a mesma série DICOM do primeiro RTSTRUCT."
+        )
 
 # ---------------------------
 # Função principal
@@ -1308,23 +1543,40 @@ def main():
     inputs, out_name, debug = parse_args()
     ds_base: Optional[Dataset] = None
     roi_map_all: Dict[str, Dict] = {}
+    output_path = os.path.realpath(out_name)
+    if os.path.exists(output_path):
+        raise SystemExit(f"Erro: o arquivo de saída já existe e não será sobrescrito: {output_path}")
 
     # Ler e agregar amostras de todos os RTSTRUCTs
     for path in inputs:
-        if not os.path.exists(path):
-            print(f"Aviso: arquivo não encontrado {path}, pulando.")
-            continue
+        if not os.path.isfile(path):
+            raise SystemExit(f"Erro: arquivo de entrada não encontrado: {path}")
+        if os.path.realpath(path) == output_path:
+            raise SystemExit("Erro: o arquivo de saída não pode sobrescrever uma entrada.")
         try:
             ds = pydicom.dcmread(path)
         except Exception as e:
-            print(f"Aviso: não foi possível ler {path}: {e}")
+            raise SystemExit(f"Erro: não foi possível ler o RTSTRUCT {path}: {e}") from e
+
+        if not has_structure_set_roi_sequence(ds):
             continue
+        if str(getattr(ds, "SOPClassUID", "")) != RTSTRUCT_SOPCLASS:
+            raise SystemExit(f"Erro: {path} não é um RTSTRUCT DICOM.")
+        if len(referenced_frame_uids(ds)) != 1 or len(referenced_series_uids(ds)) != 1:
+            raise SystemExit(
+                f"Erro: {path} não possui referências verificáveis de frame e série DICOM."
+            )
 
         if ds_base is None:
             ds_base = copy.deepcopy(ds)
             for seq_name in ("StructureSetROISequence", "ROIContourSequence", "RTROIObservationsSequence"):
                 if hasattr(ds_base, seq_name):
                     delattr(ds_base, seq_name)
+        else:
+            try:
+                validate_compatible_rtstructs(ds_base, ds, path)
+            except ValueError as error:
+                raise SystemExit(f"Erro: RTSTRUCT incompatível: {error}") from error
 
         roi_map = collect_rois_from_ds(ds)
         for norm, info in roi_map.items():
@@ -1334,14 +1586,19 @@ def main():
             roi_map_all[norm]["original_names"].update(info["original_names"])
 
     if ds_base is None:
-        print("Nenhum RTSTRUCT válido fornecido.")
-        sys.exit(1)
+        raise SystemExit("Erro: nenhum RTSTRUCT válido fornecido.")
 
     # Construir polígonos por ROI
     roi_polygons: Dict[str, List[Tuple[float, Polygon, Dataset, int]]] = {}
     for norm, entry in roi_map_all.items():
         polygons = build_polygons_for_roi_samples(entry["samples"])
         roi_polygons[norm] = polygons
+    if not roi_polygons.get("corpo"):
+        raise SystemExit(
+            "Erro: o RTSTRUCT final exige a ROI 'corpo' gerada por IHaveABody.py."
+        )
+    if not any(roi_polygons.values()):
+        raise SystemExit("Erro: os RTSTRUCTs não contêm contornos fechados utilizáveis.")
 
     # Definir chaves dos lobos pulmonares originais
     left_lobe_keys = ["lung_upper_lobe_left", "lung_lower_lobe_left"]
@@ -1482,7 +1739,8 @@ def main():
             if missing_sources
             else "não há componente caudal contínuo conectado à medula"
         )
-        print(f"Aviso: não foi possível criar tronco: {reason}.")
+        if debug:
+            print(f"Aviso: não foi possível criar tronco: {reason}.")
 
     # Avaliação das mamas: interseção com o corpo erodido em 4 mm.
     # O corpo erodido é mantido somente em memória e não é exportado.
@@ -1615,7 +1873,7 @@ def main():
     # ---------------------------
     translated_map = {}
     for norm, entry in roi_map_all.items():
-        orig_name = list(entry["original_names"])[0] if entry["original_names"] else norm
+        orig_name = representative_roi_name(entry, norm)
         t = translate_name(orig_name)
         if t.lower().startswith("vertebra_") or t.lower().startswith("vertebra"):
             t_disp = vertebra_display_name(t)
@@ -1698,7 +1956,7 @@ def main():
             continue
         if k in lobes_to_exclude:
             continue
-        rep = list(roi_map_all[k]["original_names"])[0]
+        rep = representative_roi_name(roi_map_all[k], k)
         if k not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
             continue
         remaining.append(k)
@@ -1722,6 +1980,32 @@ def main():
                 sorted(original_keys_removed),
             )
 
+    exportable_order = []
+    seen_rois = set()
+    for typ, key, region in final_order:
+        roi_id = (typ, key)
+        if roi_id in seen_rois:
+            continue
+        if typ == "orig":
+            entry = roi_map_all.get(key)
+            if not entry or not roi_polygons.get(key):
+                continue
+            name = representative_roi_name(entry, key)
+            if key not in ("breast_right", "breast_left") and translate_name(name) == "mama":
+                continue
+        else:
+            item = created_items.get(key)
+            if not item or not item.get("grouped"):
+                continue
+        exportable_order.append((typ, key, region))
+        seen_rois.add(roi_id)
+    final_order = reorder_rois_craniocaudal(
+        exportable_order,
+        roi_polygons,
+        created_items,
+        roi_map_all,
+    )
+
     # ---------------------------
     # Atribuir números sequenciais e construir sequências DICOM
     # ---------------------------
@@ -1730,24 +2014,20 @@ def main():
     ds_base.RTROIObservationsSequence = []
 
     roi_number_map: Dict[Tuple[str, str], int] = {}
-    next_roi_number = 1
 
     # Numera as ROIs na ordem em que serão exportadas.
-    for typ, key, region in final_order:
-        roi_number_map[(typ, key)] = next_roi_number
-        next_roi_number += 1
+    for number, (typ, key, region) in enumerate(final_order, start=1):
+        roi_number_map[(typ, key)] = number
 
     # Mantém sincronizadas as sequências de estruturas e observações do DICOM.
+    frame_uid = min(referenced_frame_uids(ds_base))
+
     def add_structure_and_obs(number: int, name: str, generation: str = "MANUAL", interpreted_type: Optional[str] = None):
         s_item = Dataset()
         s_item.ROINumber = int(number)
         s_item.ROIName = safe_truncate_name(name)
         s_item.ROIGenerationAlgorithm = generation
-        if hasattr(ds_base, "FrameOfReferenceUID"):
-            try:
-                s_item.ReferencedFrameOfReferenceUID = ds_base.FrameOfReferenceUID
-            except Exception:
-                pass
+        s_item.ReferencedFrameOfReferenceUID = frame_uid
         ds_base.StructureSetROISequence.append(s_item)
 
         obs = Dataset()
@@ -1770,9 +2050,7 @@ def main():
             entry = roi_map_all.get(key)
             if not entry:
                 continue
-            orig_name = list(entry["original_names"])[0] if entry["original_names"] else key
-            if key not in ("breast_right", "breast_left") and translate_name(orig_name) == "mama":
-                continue
+            orig_name = representative_roi_name(entry, key)
             t = translate_name(orig_name)
             if key == "breast_right":
                 t_disp = "mama_D"
@@ -1805,9 +2083,7 @@ def main():
         entry = roi_map_all.get(key)
         if not entry:
             continue
-        rep = list(entry["original_names"])[0] if entry["original_names"] else key
-        if key not in ("breast_right", "breast_left") and translate_name(rep) == "mama":
-            continue
+        rep = representative_roi_name(entry, key)
         translated = translate_name(rep)
         if key == "breast_right":
             display_name = "mama_D"
@@ -1815,42 +2091,52 @@ def main():
             display_name = "mama_E"
         else:
             display_name = translated
-        sample = entry["samples"][0] if entry["samples"] else None
-        if sample is None:
+        if not entry["samples"]:
             continue
-        src_ds, src_num, roi_ds = sample
-        if hasattr(src_ds, "ROIContourSequence"):
-            for roi_contour in src_ds.ROIContourSequence:
+        source_roi_contours = []
+        contour_items = []
+        for src_ds, src_num, _ in entry["samples"]:
+            for roi_contour in getattr(src_ds, "ROIContourSequence", []):
                 if getattr(roi_contour, "ReferencedROINumber", None) != src_num:
                     continue
-                if key in ("breast_right", "breast_left"):
-                    color = COLOR_MAMA_D if key == "breast_right" else COLOR_MAMA_E
-                elif key == "corpo":
-                    color = get_roi_display_color(
-                        roi_contour,
-                        ANATOMICAL_COLORS["corpo"],
-                    )
-                else:
-                    color = choose_structure_color(
-                        key,
-                        display_name,
-                        used_colors,
-                        paired_colors,
-                    )
-                new_roi_contour = copy_roi_contour_for_export(
-                    roi_contour,
-                    roi_number_map[(typ, key)],
-                    color,
-                )
-                used_colors.add(color)
-                if hasattr(new_roi_contour, "ContourSequence"):
-                    valid_contours = []
-                    for c in new_roi_contour.ContourSequence:
-                        if hasattr(c, "ContourData") and c.ContourData:
-                            valid_contours.append(c)
-                    if valid_contours:
-                        new_roi_contour.ContourSequence = valid_contours
-                        ds_base.ROIContourSequence.append(new_roi_contour)
+                valid_contours = []
+                for contour in getattr(roi_contour, "ContourSequence", []):
+                    if not getattr(contour, "ContourData", None):
+                        continue
+                    try:
+                        contour_points_from_ds(contour)
+                    except ValueError:
+                        continue
+                    valid_contours.append(copy.deepcopy(contour))
+                if valid_contours:
+                    source_roi_contours.append(roi_contour)
+                    contour_items.extend(valid_contours)
+
+        if not source_roi_contours or not contour_items:
+            continue
+        sample_roi_contour = source_roi_contours[0]
+        if key in ("breast_right", "breast_left"):
+            color = COLOR_MAMA_D if key == "breast_right" else COLOR_MAMA_E
+        elif key == "corpo":
+            color = get_roi_display_color(
+                sample_roi_contour,
+                ANATOMICAL_COLORS["corpo"],
+            )
+        else:
+            color = choose_structure_color(
+                key,
+                display_name,
+                used_colors,
+                paired_colors,
+            )
+        new_roi_contour = copy_roi_contour_for_export(
+            sample_roi_contour,
+            roi_number_map[(typ, key)],
+            color,
+        )
+        new_roi_contour.ContourSequence = contour_items
+        used_colors.add(color)
+        ds_base.ROIContourSequence.append(new_roi_contour)
 
     # Adicionar ROIs criadas (avaliações, pulmões, medula_PRV, tronco, costelas)
     for typ, key, region in final_order:
@@ -1864,20 +2150,44 @@ def main():
         if hasattr(rc, "ContourSequence") and rc.ContourSequence:
             ds_base.ROIContourSequence.append(rc)
 
+    structure_numbers = {
+        int(item.ROINumber) for item in ds_base.StructureSetROISequence
+    }
+    contour_numbers = {
+        int(item.ReferencedROINumber) for item in ds_base.ROIContourSequence
+    }
+    observation_numbers = {
+        int(item.ReferencedROINumber) for item in ds_base.RTROIObservationsSequence
+    }
+    if not structure_numbers or structure_numbers != contour_numbers:
+        raise SystemExit(
+            "Erro: sequência final de ROIs não corresponde aos contornos exportados."
+        )
+    if structure_numbers != observation_numbers:
+        raise SystemExit(
+            "Erro: sequência final de observações não corresponde às ROIs exportadas."
+        )
+
     # Metadados para compatibilidade XiO
-    try:
-        ds_base.SOPClassUID = RTSTRUCT_SOPCLASS
-        ds_base.SOPInstanceUID = generate_uid()
-        ds_base.SeriesInstanceUID = generate_uid()
-        ds_base.StructureSetLabel = getattr(ds_base, "StructureSetLabel", "XiO_Converted")
-    except Exception:
-        pass
+    ds_base.SOPClassUID = RTSTRUCT_SOPCLASS
+    ds_base.SOPInstanceUID = generate_uid()
+    ds_base.SeriesInstanceUID = generate_uid()
+    ds_base.StructureSetLabel = getattr(ds_base, "StructureSetLabel", "XiO_Converted")
+    if not getattr(ds_base, "file_meta", None):
+        raise SystemExit("Erro: o RTSTRUCT base não possui metadados de arquivo DICOM.")
+    ds_base.file_meta.MediaStorageSOPClassUID = RTSTRUCT_SOPCLASS
+    ds_base.file_meta.MediaStorageSOPInstanceUID = ds_base.SOPInstanceUID
 
     # Salvar
     try:
-        ds_base.save_as(out_name)
+        ds_base.save_as(output_path)
+        saved = pydicom.dcmread(output_path, stop_before_pixels=True)
+        if str(getattr(saved, "SOPClassUID", "")) != RTSTRUCT_SOPCLASS:
+            raise ValueError("o arquivo salvo não é um RTSTRUCT.")
+        if len(getattr(saved, "StructureSetROISequence", [])) != len(structure_numbers):
+            raise ValueError("o arquivo salvo não preservou a sequência de ROIs.")
         if debug:
-            print(f"Arquivo salvo: {out_name}")
+            print(f"Arquivo salvo: {output_path}")
             print("ROIs criadas:", list(created_items.keys()))
             print(
                 "Avaliações de mama exportadas:",
@@ -1885,8 +2195,7 @@ def main():
             )
             print("Ordem final:", final_order)
     except Exception as e:
-        print(f"Erro ao salvar {out_name}: {e}")
-        sys.exit(1)
+        raise SystemExit(f"Erro ao salvar ou verificar {output_path}: {e}") from e
 
 if __name__ == "__main__":
     main()
