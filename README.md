@@ -413,3 +413,33 @@ módulo. Cite a referência geral do TotalSegmentator e não associe a esses
 módulos artigos que a documentação não aponta. Confirme as instruções de
 citação na versão instalada antes de publicar, pois a lista de tarefas e
 referências pode mudar.
+
+## Análise interativa de escore de Agatston
+
+O utilitário independente `CAC.py` analisa uma série CT DICOM e estruturas de
+um ou mais RTSTRUCTs. Execute-o no ambiente Python que contém as dependências
+do projeto:
+
+```bash
+python3 CAC.py
+```
+
+Escolha a pasta da série CT e, na etapa seguinte, selecione diretamente um ou
+mais arquivos RTSTRUCT compatíveis. Os resultados podem ser copiados como
+texto tabulado, incluindo identificação da paciente, ou salvos como relatório
+PDF. A exportação PDF requer `reportlab`:
+
+```bash
+python3 -m pip install reportlab
+```
+
+O PDF é salvo em orientação retrato e inclui a data do estudo da tomografia
+(priorizando `StudyDate` e usando datas DICOM alternativas se necessário) e
+a data e hora local da geração do relatório.
+
+Os nomes conhecidos `myocardium`, `atrium_left`, `ventricle_left`,
+`atrium_right`, `ventricle_right`, `aorta` e `pulmonary_artery` são exibidos em
+português. O relatório explica o fator aplicado por faixa de densidade e as
+faixas de interpretação do escore. O resultado é uma ferramenta auxiliar e
+deve ser conferido por profissional qualificado; não substitui avaliação
+clínica nem revisão das imagens e estruturas DICOM.
