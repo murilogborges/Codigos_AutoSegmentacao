@@ -173,13 +173,41 @@ class CACDicomTests(unittest.TestCase):
         _write_rtstruct(paths[1], self.series_uid, self.frame_uid,
                         [0, 0, 2, 4, 0, 2, 4, 3, 2, 0, 3, 2])
 
-        with patch.object(CAC.filedialog, "askopenfilenames",
-                          return_value=tuple(map(str, paths))) as picker:
+        with patch.object(
+            CAC.filedialog,
+            "askopenfilenames",
+            return_value=tuple(map(str, paths)),
+        ) as picker:
             selected = CAC._choose_rtstruct_files(object(), self.folder, volume)
 
         self.assertEqual([Path(dataset.filename) for dataset in selected], paths)
         picker.assert_called_once()
+        self.assertEqual(picker.call_args.kwargs["initialdir"], str(self.folder))
         self.assertIn("Ctrl/Shift", picker.call_args.kwargs["title"])
+
+    def test_ct_folder_picker_uses_native_directory_dialog(self):
+        root = object()
+        with patch.object(CAC.filedialog, "askdirectory", return_value=str(self.folder)) as picker:
+            selected = CAC._choose_ct_folder(root, self.folder)
+
+        self.assertEqual(selected, str(self.folder))
+        picker.assert_called_once_with(
+            parent=root,
+            title="Selecione a pasta com as imagens CT DICOM",
+            initialdir=str(self.folder),
+            mustexist=True,
+        )
+
+    def test_pdf_suggested_directory_is_sibling_of_ct_folder(self):
+        ct_folder = self.folder / "CT"
+        ct_folder.mkdir()
+        ct_file = ct_folder / "slice.dcm"
+        ct_file.touch()
+        volume = type("TestVolume", (), {
+            "slices": [type("TestSlice", (), {"filename": str(ct_file)})()]
+        })()
+
+        self.assertEqual(CAC._pdf_initial_directory(volume), self.folder)
 
     def test_anatomical_roi_names_are_translated_to_portuguese(self):
         dataset = Dataset()
@@ -299,6 +327,9 @@ class CACDicomTests(unittest.TestCase):
         self.assertIn(b"Data da an", page_content)
         self.assertIn(b"15/10/2026", page_content)
         self.assertNotIn(b"20:45:00", page_content)
+        self.assertIn(b"BELARDO, Alfonso et al.", page_content)
+        self.assertIn(b"10.1016/j.radonc.2025.111098", page_content)
+        self.assertNotIn(b"Acesso em:", page_content)
         ct_dataset = _write_ct(
             self.folder / "date-test.dcm",
             self.series_uid,
@@ -307,6 +338,106 @@ class CACDicomTests(unittest.TestCase):
             100,
         )
         self.assertEqual(CAC._tomography_date(ct_dataset), "30/06/2024")
+
+    def test_pdf_adds_one_physical_crop_page_per_positive_score_structure(self):
+        from PIL import Image
+
+        volume = self._create_volume()
+        contour_data = [0, 0, 2, 4, 0, 2, 4, 3, 2, 0, 3, 2]
+        rtstruct = _write_rtstruct(
+            self.folder / "report-rtstruct.dcm",
+            self.series_uid,
+            self.frame_uid,
+            contour_data,
+            roi_name="coronary",
+        )
+        structures, notices = CAC.merge_rtstructs([rtstruct])
+        self.assertEqual(notices, [])
+        dataframe = pd.DataFrame([
+            {
+                "ROI": roi_name,
+                CAC.AGATSTON_SCORE_COLUMN: 72.0,
+                "Volume_score": 48.0,
+                "Interpretação": "Risco leve",
+                "Cor": "yellow",
+            }
+            for roi_name in ("coronary", "aorta")
+        ])
+        dataframe.loc[len(dataframe)] = {
+            "ROI": "sem_calcificacao",
+            CAC.AGATSTON_SCORE_COLUMN: 0.0,
+            "Volume_score": 0.0,
+            "Interpretação": "Nenhum risco detectável",
+            "Cor": "green",
+        }
+        structures["aorta"] = structures["coronary"]
+        findings = CAC._top_calcifications(structures["coronary"], volume)
+        self.assertEqual(len(findings), 1)
+        finding = findings[0]
+        self.assertEqual(finding["slice_index"], 1)
+        self.assertEqual(finding["maximum_hu"], 300.0)
+        image_bytes = CAC._render_calcification_crop(volume, finding)
+        crop = Image.open(image_bytes)
+        self.assertEqual(crop.size, (50, 100))
+        self.assertIn((255, 40, 40), crop.getdata())
+        self.assertNotIn((0, 255, 255), crop.getdata())
+        output_path = self.folder / "report-with-images.pdf"
+
+        with patch.object(
+            CAC,
+            "_top_calcifications",
+            return_value=[finding, finding, finding],
+        ):
+            CAC.save_report_pdf(
+                output_path,
+                dataframe,
+                "Paciente Teste",
+                "ID-123",
+                "30/06/2024",
+                "15/10/2026",
+                volume=volume,
+                structures=structures,
+            )
+
+        pdf_bytes = output_path.read_bytes()
+        self.assertEqual(len(re.findall(rb"/Type\s*/Page\b", pdf_bytes)), 3)
+        self.assertGreaterEqual(len(re.findall(rb"/Subtype\s*/Image", pdf_bytes)), 1)
+        page_content = b" ".join(
+            zlib.decompress(
+                base64.a85decode(match.group(1).rstrip(b"\r\n"), adobe=True)
+            )
+            for match in re.finditer(
+                rb"stream\r?\n(.*?)endstream", pdf_bytes, re.DOTALL
+            )
+        )
+        self.assertIn(b"Calcifica", page_content)
+        self.assertIn(b"coronary", page_content)
+        self.assertIn(b"aorta", page_content)
+        self.assertIn(b"recorte de 10", page_content)
+        self.assertEqual(page_content.count(b"Calcifica"), 2)
+        self.assertEqual(page_content.count(b"Grupo 1"), 2)
+        self.assertEqual(page_content.count(b"Grupo 2"), 2)
+        self.assertEqual(page_content.count(b"Grupo 3"), 2)
+        self.assertNotIn(b"separados por mais", page_content)
+
+    def test_calcification_selection_keeps_three_groups_over_five_mm_apart(self):
+        candidates = [
+            {"score": 50, "maximum_hu": 300, "slice_index": 0,
+             "center": (10, 10), "cluster": [(10, 10)]},
+            {"score": 45, "maximum_hu": 300, "slice_index": 0,
+             "center": (10, 12.5), "cluster": [(10, 12)]},
+            {"score": 40, "maximum_hu": 250, "slice_index": 0,
+             "center": (10, 13), "cluster": [(10, 13)]},
+            {"score": 35, "maximum_hu": 200, "slice_index": 0,
+             "center": (10, 16), "cluster": [(10, 16)]},
+        ]
+
+        selected = CAC._select_distinct_calcifications(
+            candidates,
+            pixel_spacing=(1.0, 2.0),
+        )
+
+        self.assertEqual([item["score"] for item in selected], [50, 40, 35])
 
     def test_invalid_files_are_ignored_and_clusters_do_not_recurse(self):
         _write_ct(self.folder / "slice.dcm", self.series_uid,

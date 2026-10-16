@@ -435,7 +435,13 @@ python3 -m pip install reportlab
 
 O PDF é salvo em orientação retrato e inclui a data do estudo da tomografia
 (priorizando `StudyDate` e usando datas DICOM alternativas se necessário) e
-a data e hora local da geração do relatório.
+a data local da geração do relatório. A janela de salvamento abre inicialmente
+na pasta que contém a pasta da série CT. Para cada estrutura com Agatston maior
+que zero, o relatório acrescenta uma página com um recorte físico de 10 × 10 cm
+do corte, mostrando até os três agrupamentos calcificados com maior
+contribuição ao score. No mesmo corte axial, os centros dos agrupamentos
+selecionados ficam separados por mais de 0,5 cm. O contorno vermelho delimita
+a estrutura analisada.
 
 Os nomes conhecidos `myocardium`, `atrium_left`, `ventricle_left`,
 `atrium_right`, `ventricle_right`, `aorta` e `pulmonary_artery` são exibidos em

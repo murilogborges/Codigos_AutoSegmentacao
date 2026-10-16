@@ -2,7 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import csv
 from datetime import datetime
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -19,6 +19,12 @@ from skimage import draw
 CT_IMAGE_UID = str(CTImageStorage)
 RTSTRUCT_UID = str(RTStructureSetStorage)
 AGATSTON_SCORE_COLUMN = "Agatston_score"
+ARTICLE_REFERENCE_ABNT = (
+    "BELARDO, Alfonso et al. Density and volume of cardiac calcifications detected "
+    "on planning CT predicts cardiotoxicity after hypo-fractionated whole breast "
+    "Radiotherapy. <i>Radiotherapy and Oncology</i>, v. 211, art. 111098, 2025. "
+    "DOI: https://doi.org/10.1016/j.radonc.2025.111098."
+)
 ROI_TRANSLATIONS = {
     "cardiac_area": "Área cardíaca",
     "aorta": "Aorta",
@@ -376,6 +382,15 @@ def _center_window(window, width, height):
     window.minsize(width, height)
 
 
+def _choose_ct_folder(root, initial_folder):
+    return filedialog.askdirectory(
+        parent=root,
+        title="Selecione a pasta com as imagens CT DICOM",
+        initialdir=str(initial_folder),
+        mustexist=True,
+    )
+
+
 def _choose_ct_series(root, series):
     if len(series) == 1:
         return next(iter(series))
@@ -633,6 +648,152 @@ def _tomography_date(dataset):
     return "Não informada"
 
 
+def _pdf_initial_directory(volume):
+    return Path(volume.slices[0].filename).parent.parent
+
+
+def _select_distinct_calcifications(
+    candidates,
+    pixel_spacing,
+    limit=3,
+    minimum_distance_mm=5,
+):
+    row_spacing, column_spacing = pixel_spacing
+    ordered = sorted(
+        candidates,
+        key=lambda item: (
+            -item["score"],
+            -item["maximum_hu"],
+            -len(item["cluster"]),
+            item["slice_index"],
+            item["center"],
+        ),
+    )
+    selected = []
+    for candidate in ordered:
+        too_close = False
+        for existing in selected:
+            if candidate["slice_index"] != existing["slice_index"]:
+                continue
+            row_delta = (
+                candidate["center"][0] - existing["center"][0]
+            ) * row_spacing
+            column_delta = (
+                candidate["center"][1] - existing["center"][1]
+            ) * column_spacing
+            if np.hypot(row_delta, column_delta) <= minimum_distance_mm:
+                too_close = True
+                break
+        if not too_close:
+            selected.append(candidate)
+            if len(selected) == limit:
+                break
+    return selected
+
+
+def _top_calcifications(contours, volume, limit=3, minimum_distance_mm=5):
+    structure_mask, _, _ = get_mask_from_contours(contours, volume)
+    candidates = []
+    for slice_index in range(volume.image.shape[2]):
+        masked_slice = np.where(
+            structure_mask[:, :, slice_index],
+            volume.image[:, :, slice_index],
+            np.nan,
+        )
+        for cluster in find_clusters(masked_slice):
+            score, _ = agatson_score(masked_slice, cluster, volume, slice_index)
+            if score <= 0:
+                continue
+            maximum_hu = max(
+                float(masked_slice[row, column]) for row, column in cluster
+            )
+            center_row = sum(row for row, _ in cluster) / len(cluster)
+            center_column = sum(column for _, column in cluster) / len(cluster)
+            candidates.append({
+                "score": score,
+                "maximum_hu": maximum_hu,
+                "slice_index": slice_index,
+                "center": (center_row, center_column),
+                "cluster": cluster,
+                "structure_mask": structure_mask[:, :, slice_index],
+            })
+    return _select_distinct_calcifications(
+        candidates,
+        volume.pixel_spacing,
+        limit=limit,
+        minimum_distance_mm=minimum_distance_mm,
+    )
+
+
+def _mask_boundary(mask):
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    inner = padded[1:-1, 1:-1]
+    interior = (
+        padded[:-2, 1:-1]
+        & padded[2:, 1:-1]
+        & padded[1:-1, :-2]
+        & padded[1:-1, 2:]
+    )
+    return inner & ~interior
+
+
+def _render_calcification_crop(volume, finding, size_mm=100):
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "A biblioteca Pillow é necessária para incluir imagens no relatório PDF."
+        ) from error
+
+    row_spacing, column_spacing = volume.pixel_spacing
+    crop_rows = max(1, int(round(size_mm / row_spacing)))
+    crop_columns = max(1, int(round(size_mm / column_spacing)))
+    center_row, center_column = finding["center"]
+    center_row = int(round(center_row))
+    center_column = int(round(center_column))
+    row_start = center_row - crop_rows // 2
+    column_start = center_column - crop_columns // 2
+    row_end = row_start + crop_rows
+    column_end = column_start + crop_columns
+
+    image_slice = volume.image[:, :, finding["slice_index"]]
+    hu_crop = np.full((crop_rows, crop_columns), -1000.0, dtype=np.float32)
+    structure_crop = np.zeros((crop_rows, crop_columns), dtype=bool)
+    source_row_start = max(0, row_start)
+    source_column_start = max(0, column_start)
+    source_row_end = min(image_slice.shape[0], row_end)
+    source_column_end = min(image_slice.shape[1], column_end)
+    if source_row_start < source_row_end and source_column_start < source_column_end:
+        target_rows = slice(
+            source_row_start - row_start,
+            source_row_end - row_start,
+        )
+        target_columns = slice(
+            source_column_start - column_start,
+            source_column_end - column_start,
+        )
+        source = (
+            slice(source_row_start, source_row_end),
+            slice(source_column_start, source_column_end),
+        )
+        hu_crop[target_rows, target_columns] = image_slice[source]
+        structure_crop[target_rows, target_columns] = finding["structure_mask"][source]
+
+    window_low, window_high = -100.0, 300.0
+    grayscale = np.clip(
+        (hu_crop - window_low) * (255.0 / (window_high - window_low)),
+        0,
+        255,
+    ).astype(np.uint8)
+    rgb = np.repeat(grayscale[:, :, np.newaxis], 3, axis=2)
+    rgb[_mask_boundary(structure_crop)] = (255, 40, 40)
+
+    output = BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(output, format="PNG")
+    output.seek(0)
+    return output
+
+
 def results_as_text(dataframe, patient_name, patient_id):
     dataframe = normalize_results_dataframe(dataframe)
     output = StringIO()
@@ -654,8 +815,12 @@ def save_report_pdf(
     patient_id,
     tomography_date,
     analysis_date,
+    volume=None,
+    structures=None,
 ):
     dataframe = normalize_results_dataframe(dataframe)
+    if (volume is None) != (structures is None):
+        raise ValueError("Volume CT e estruturas RTSTRUCT devem ser fornecidos juntos.")
     from xml.sax.saxutils import escape
 
     try:
@@ -665,10 +830,13 @@ def save_report_pdf(
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
         from reportlab.platypus import (
+            Image as ReportImage,
             LongTable,
+            PageBreak,
             Paragraph,
             SimpleDocTemplate,
             Spacer,
+            Table as ReportTable,
             TableStyle,
         )
     except ModuleNotFoundError as error:
@@ -686,7 +854,7 @@ def save_report_pdf(
         rightMargin=11 * mm,
         leftMargin=11 * mm,
         topMargin=12 * mm,
-        bottomMargin=16 * mm,
+        bottomMargin=23 * mm,
         title="Resultado da análise de escore de Agatston",
         author="CAC",
     )
@@ -812,13 +980,104 @@ def save_report_pdf(
         ),
     ])
 
+    if volume is not None:
+        caption_style = ParagraphStyle(
+            "ReportImageCaption",
+            parent=body_style,
+            alignment=TA_CENTER,
+            fontSize=8,
+            leading=10,
+        )
+        structure_items = {str(name): contours for name, contours in structures.items()}
+        for _, row in dataframe.iterrows():
+            score = float(row[AGATSTON_SCORE_COLUMN])
+            if score <= 0:
+                continue
+            roi_name = str(row["ROI"])
+            contours = structure_items.get(roi_name)
+            if contours is None:
+                raise ValueError(
+                    f"Não foi possível localizar os contornos de {roi_name} "
+                    "para incluir a imagem no relatório."
+                )
+            findings = _top_calcifications(contours, volume)
+            if not findings:
+                raise ValueError(
+                    f"Não foi possível localizar o agrupamento calcificado de "
+                    f"{roi_name} para incluir a imagem no relatório."
+                )
+            panels = []
+            for index, finding in enumerate(findings, start=1):
+                slice_dataset = volume.slices[finding["slice_index"]]
+                slice_label = getattr(slice_dataset, "InstanceNumber", None)
+                if slice_label is None:
+                    slice_label = finding["slice_index"] + 1
+                panels.append([
+                    Paragraph(
+                        f"<b>Grupo {index}</b><br/>"
+                        f"Contribuição: {finding['score']:.1f}<br/>"
+                        f"Corte axial: {escape(str(slice_label))}",
+                        caption_style,
+                    ),
+                    ReportImage(
+                        _render_calcification_crop(volume, finding),
+                        width=55 * mm,
+                        height=55 * mm,
+                        hAlign="CENTER",
+                    ),
+                ])
+            panel_table = ReportTable(
+                [panels],
+                colWidths=[59 * mm] * len(panels),
+                hAlign="CENTER",
+            )
+            panel_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ]))
+            story.extend([
+                PageBreak(),
+                Paragraph(
+                    f"Calcificação: {escape(roi_name)}",
+                    section_style,
+                ),
+                Paragraph(
+                    f"<b>Agatston score da estrutura:</b> {score:.1f} &nbsp;&nbsp; "
+                    f"<b>Agrupamentos exibidos:</b> {len(findings)}",
+                    body_style,
+                ),
+                Spacer(1, 4 * mm),
+                panel_table,
+                Spacer(1, 3 * mm),
+                Paragraph(
+                    "Cada imagem mostra um recorte de 10 × 10 cm. O contorno "
+                    "vermelho delimita a estrutura.",
+                    caption_style,
+                ),
+            ])
+
     def draw_page_number(canvas, _document):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(colors.HexColor("#666666"))
+        reference_style = ParagraphStyle(
+            "ReportReference",
+            parent=body_style,
+            fontSize=6.5,
+            leading=7.5,
+            textColor=colors.HexColor("#666666"),
+        )
+        reference = Paragraph(
+            "<b>Referência:</b> " + ARTICLE_REFERENCE_ABNT,
+            reference_style,
+        )
+        reference_width = page_size[0] - document.leftMargin - document.rightMargin
+        reference.wrap(reference_width, document.bottomMargin)
+        reference.drawOn(canvas, document.leftMargin, 5 * mm)
         canvas.drawRightString(
             page_size[0] - 14 * mm,
-            9 * mm,
+            2 * mm,
             f"Página {canvas.getPageNumber()}",
         )
         canvas.restoreState()
@@ -826,7 +1085,7 @@ def save_report_pdf(
     document.build(story, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
 
 
-def show_results(root, dataframe, volume):
+def show_results(root, dataframe, volume, structures):
     dataframe = normalize_results_dataframe(dataframe)
     first_slice = volume.slices[0]
     patient_name = str(getattr(first_slice, "PatientName", "Desconhecido"))
@@ -834,10 +1093,14 @@ def show_results(root, dataframe, volume):
     tomography_date = _tomography_date(first_slice)
     window = tk.Toplevel(root)
     window.title(f"Resultados - Paciente: {patient_name} (ID: {patient_id})")
-    _center_window(window, 920, 520)
 
     columns = ("ROI", AGATSTON_SCORE_COLUMN, "Volume_score", "Interpretação")
-    tree = ttk.Treeview(window, columns=columns, show="headings")
+    tree = ttk.Treeview(
+        window,
+        columns=columns,
+        show="headings",
+        height=max(1, min(len(dataframe), 15)),
+    )
     labels = {
         "ROI": "Estrutura",
         AGATSTON_SCORE_COLUMN: "Agatston Score",
@@ -849,7 +1112,6 @@ def show_results(root, dataframe, volume):
     for column in columns:
         tree.heading(column, text=labels[column])
         tree.column(column, width=widths[column], minwidth=90, stretch=True)
-
     def copy_results():
         try:
             root.clipboard_clear()
@@ -874,7 +1136,7 @@ def show_results(root, dataframe, volume):
         output_path = filedialog.asksaveasfilename(
             parent=window,
             title="Salvar relatório em PDF",
-            initialdir=str(Path.home()),
+            initialdir=str(_pdf_initial_directory(volume)),
             initialfile=safe_name,
             defaultextension=".pdf",
             filetypes=[("Documento PDF", "*.pdf")],
@@ -890,6 +1152,8 @@ def show_results(root, dataframe, volume):
                 patient_id,
                 tomography_date,
                 analysis_date,
+                volume=volume,
+                structures=structures,
             )
         except (OSError, ValueError, ImportError, RuntimeError) as error:
             messagebox.showerror("Erro ao salvar o PDF", str(error), parent=window)
@@ -907,12 +1171,10 @@ def show_results(root, dataframe, volume):
         side="left"
     )
 
-    results_frame = ttk.Frame(window)
-    results_frame.pack(side="top", fill="both", expand=True, padx=10, pady=0)
-    scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=tree.yview)
+    scrollbar = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=scrollbar.set)
-    tree.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
+    tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(10, 0))
+    scrollbar.pack(side="left", fill="y", padx=(0, 10), pady=(10, 0))
 
     style = ttk.Style(window)
     style.configure("Treeview", rowheight=25)
@@ -927,6 +1189,9 @@ def show_results(root, dataframe, volume):
     tree.tag_configure("yellow", background="lightyellow")
     tree.tag_configure("orange", background="orange")
     tree.tag_configure("red", background="tomato")
+    window.update_idletasks()
+    window_height = min(520, max(150, window.winfo_reqheight()))
+    _center_window(window, 920, window_height)
     window.protocol("WM_DELETE_WINDOW", root.destroy)
 
 
@@ -937,12 +1202,7 @@ def main():
         "Erro inesperado", str(error), parent=root
     )
 
-    ct_folder = filedialog.askdirectory(
-        parent=root,
-        title="Selecione a pasta com as imagens CT DICOM",
-        initialdir=str(Path.home()),
-        mustexist=True,
-    )
+    ct_folder = _choose_ct_folder(root, Path.home())
     if not ct_folder:
         root.destroy()
         return
@@ -993,14 +1253,7 @@ def main():
     if not rtstructs:
         root.destroy()
         return
-    structures, merge_notices = merge_rtstructs(rtstructs)
-    if merge_notices:
-        messagebox.showwarning(
-            "Contornos ignorados",
-            "\n".join(merge_notices[:8])
-            + ("\n..." if len(merge_notices) > 8 else ""),
-            parent=root,
-        )
+    structures, _merge_notices = merge_rtstructs(rtstructs)
     if not structures:
         messagebox.showerror(
             "Sem contornos",
@@ -1010,15 +1263,8 @@ def main():
         root.destroy()
         return
 
-    dataframe, invalid_contours, outside_contours = calculate_results(structures, volume)
-    if invalid_contours or outside_contours:
-        messagebox.showwarning(
-            "Contornos ignorados",
-            f"{invalid_contours} contorno(s) inválido(s) e "
-            f"{outside_contours} fora da série CT foram ignorados.",
-            parent=root,
-        )
-    show_results(root, dataframe, volume)
+    dataframe, _invalid_contours, _outside_contours = calculate_results(structures, volume)
+    show_results(root, dataframe, volume, structures)
     root.mainloop()
 
 
