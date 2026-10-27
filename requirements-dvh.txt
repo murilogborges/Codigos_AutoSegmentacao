@@ -1,0 +1,6 @@
+matplotlib
+numpy
+pydicom
+rt-utils
+scipy
+scikit-image

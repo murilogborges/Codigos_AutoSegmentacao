@@ -47,7 +47,77 @@ particular quando houver GPU/CUDA. O primeiro uso pode baixar pesos e exigir
 acesso à rede. Não execute uma instalação nova diretamente em um ambiente
 clínico sem antes validar a versão e as permissões aplicáveis.
 
-### 1.2. Arquivos de entrada
+### 1.2. Instalação por plataforma e execução no IFGW
+
+O procedimento interno de instalação recomenda Python 3.12. No Windows, é
+possível usar Python instalado pela Microsoft Store ou executar o fluxo em
+Ubuntu pelo WSL. Para Windows nativo, verifique também os runtimes do
+Microsoft Visual C++ (incluindo os requisitos de compatibilidade das
+dependências instaladas); a disponibilidade e a versão necessárias podem
+mudar conforme Python, PyTorch e TotalSegmentator. O documento de origem
+menciona o runtime Visual C++ 2008 e as versões atuais para Visual Studio
+2017–2026; confirme quais são realmente exigidos pelas dependências da
+instalação atual. Para configurar WSL em uma máquina Windows, o procedimento
+interno começa com `wsl --install` e a instalação de Ubuntu, seguida da
+reinicialização indicada pelo instalador. No Ubuntu, o documento interno
+propõe criar um ambiente virtual e instalar as dependências nele:
+
+```bash
+sudo apt install python3 python3-pip
+python3 -m venv ambientePython
+ambientePython/bin/pip install TotalSegmentator rt_utils
+```
+
+Nos servidores do IFGW, siga primeiro o procedimento institucional de acesso
+ao gateway e ao servidor de processamento. O fluxo documentado usa SSH com
+encaminhamento pelo gateway, ativa o ambiente Python gerenciado pelo `pyenv`
+(no tutorial de referência, `31214`) e instala `TotalSegmentator`,
+`rt_utils`, `numpy`, `pydicom` e `bz2file` nesse ambiente. Os nomes de host,
+contas, chaves e instruções de autenticação devem ser obtidos do manual
+institucional autorizado, não registrados neste README nem compartilhados.
+Para transferir os estudos, o procedimento usa WinSCP com SFTP e túnel SSH;
+proteja as credenciais e confirme que o túnel está configurado conforme a
+política local.
+
+### 1.3. Preparar e exportar o estudo no 3D Slicer
+
+O fluxo de trabalho descrito no documento fornecido separa os dados originais,
+as imagens preparadas no Slicer e os resultados do TotalSegmentator:
+
+1. Exporte do XiO os arquivos DICOM usando a opção de anonimização do DICOM
+   Export e guarde a entrada em `0_CT_XIO`.
+2. Importe o estudo no 3D Slicer pelo botão **Import DICOM files**. Instale
+   as extensões apropriadas usando o gerenciador de extensões. A lista
+   ilustrada no documento inclui NNUNet, PyTorch, SlicerPythonTestRunner,
+   SlicerRT, SlicerRadiomics e TotalSegmentator; confirme na documentação
+   atual quais delas são necessárias para a tarefa que será executada.
+3. Na sequência DICOM do Slicer, selecione o estudo e use **Export to
+   DICOM...**. Escolha um tipo de exportação que preserve as imagens CT
+   (a captura do procedimento mostra a opção `RT (50%, 7 series)`).
+4. Guarde em `1_CT_SLICER` somente as instâncias de imagem CT: não inclua
+   RTDOSE nem RTSTRUCT nessa pasta de entrada do processamento.
+5. Transfira a pasta CT preparada ao servidor autorizado, execute a
+   segmentação e recupere os arquivos DICOM resultantes em
+   `2_TotalSegmentator`.
+
+As capturas abaixo foram selecionadas do documento fornecido; a tela de
+exportação foi recortada para não reproduzir metadados do estudo nem caminhos
+de usuário.
+
+**Importação DICOM no Slicer**
+
+![Botão de importação DICOM do 3D Slicer](docs/images/slicer-import-dicom-button.png)
+
+**Extensões exibidas no documento** — confirme os requisitos da tarefa; nem
+todas as extensões da captura são obrigatórias para todos os fluxos.
+
+<img src="docs/images/slicer-recommended-extensions.png" alt="Extensões exibidas no gerenciador do 3D Slicer" width="480">
+
+**Tipo de exportação DICOM**
+
+![Opções de exportação RT no 3D Slicer](docs/images/slicer-dicom-export-type.png)
+
+### 1.4. Arquivos de entrada
 
 Prepare uma pasta por paciente e aponte para a pasta que contém a série de
 imagens DICOM a processar. Use uma aquisição CT compatível com as tarefas
@@ -78,15 +148,6 @@ ignorando `_`, hífenes, espaços e maiúsculas/minúsculas. Exemplos:
 Se a lateralidade aparecer dos dois lados do número e os indicadores forem
 conflitantes, o lançador aborta por ambiguidade, sem iniciar segmentações.
 Caso nenhum indicador seja encontrado, usa o arquivo MAMA sem sufixo.
-
-As saídas RTSTRUCT individuais de cada tarefa podem permanecer na pasta entre
-execuções: se um arquivo esperado, como `TOTAL_META.dcm`, já existir e não
-estiver vazio, a tarefa correspondente será pulada e o arquivo reutilizado.
-Um arquivo final consolidado já existente, um RTSTRUCT de tarefa vazio, um
-resíduo NIfTI sem o RTSTRUCT correspondente ou um arquivo intermediário
-derivado preexistente causam interrupção para evitar sobrescrita acidental.
-Para refazer uma tarefa, mova ou remova manualmente apenas os arquivos de
-saída correspondentes a ela e os artefatos derivados afetados.
 
 ## 2. Executar o lançador
 
@@ -333,7 +394,119 @@ no processamento automático. Erros fatais de leitura, referências DICOM
 incompatíveis ou ausência de contornos aproveitáveis são mostrados quando
 impedem gerar o arquivo final.
 
-## 8. Opções, licenças, privacidade e limitações
+## 8. Comparação interativa de estruturas e DVH
+
+O aplicativo `rt_dvh_app.py` oferece uma interface gráfica para comparar
+estruturas e calcular histogramas dose-volume (DVH) a partir de CT, RTSTRUCT
+e RTDOSE. Instale as dependências adicionais no ambiente Python usado para
+executar o aplicativo:
+
+```bash
+python -m pip install -r requirements-dvh.txt
+python rt_dvh_app.py
+```
+
+O aplicativo requer Python 3.10 ou superior.
+
+Na janela, selecione a pasta DICOM. O programa identifica as séries CT, os
+arquivos RTDOSE e os RTSTRUCTs encontrados; o seletor de imagem CT também
+mostra o nome do paciente lido dos metadados DICOM. Se a dose não estiver na
+pasta, use **Procurar RTDOSE...** para selecioná-la em outro local. Escolha
+explicitamente a imagem CT, a dose, o RTSTRUCT de auto-segmentação à esquerda
+e o RTSTRUCT médico à direita. Se existir um RTSTRUCT com nome começando por
+`TOTAL_`, ele é selecionado por padrão para a auto-segmentação; um arquivo
+RTSTRUCT válido começando por `SS` é preferido para o conjunto médico.
+Se um arquivo não aparecer na lista, use **Abrir RTSTRUCT...** junto ao seletor
+correspondente para carregá-lo manualmente, independentemente do nome/prefixo
+do arquivo. Estruturas com `Isocenter` no nome são removidas dos seletores.
+Os dois painéis de estruturas usam caixas de seleção individuais e barra de
+rolagem. No painel médico, todas as ROIs contendo `PTV` no nome são
+pré-selecionadas quando disponíveis. Se nenhuma ROI contiver `PTV`, nenhuma
+estrutura é selecionada automaticamente: escolha manualmente a(s) estrutura(s)
+médica(s). Após configurar os seletores, clique **Iniciar análise 3D**. A
+visualização será aberta em uma janela separada. Só então o programa verifica
+quais ROIs da auto-segmentação têm pelo menos 60%
+do volume dentro da união médica e pergunta se deseja selecioná-las. Você pode
+aceitar a sugestão e depois ajustar as caixas da esquerda, ou recusá-la e
+manter sua seleção manual. Se nenhuma atingir 60%, o aplicativo informa as
+maiores porcentagens de inclusão; se todas forem zero, orienta verificar
+paciente e espaço físico/Frame of Reference dos RTSTRUCTs. A visualização 3D
+processa apenas as ROIs marcadas; o cálculo DVH também usa apenas essas
+seleções. Para encontrar as candidatas
+com inclusão de pelo menos 60%, o primeiro início da análise precisa rasterizar
+temporariamente as ROIs da esquerda; apenas as escolhidas são mantidas em
+cache e preparadas para a visualização. A lista de percentuais é guardada para
+evitar repetir essa comparação quando as seleções não mudam. Após iniciar a
+análise, a visualização 3D mostra cada conjunto em seu próprio painel, sem
+rotação automática. Os eixos são ocultos, e a rotação manual em qualquer painel
+é sincronizada imediatamente com o outro. **Calcular DVH** abre uma janela
+separada com gráficos de volume percentual e absoluto (cm³). O DVH inclui
+uma curva para cada estrutura auto-segmentada marcada, a união dessas
+estruturas, as margens de 0,5 cm e 1 cm e a união médica, identificada como
+**PTV Original**.
+
+As estruturas com margem são sempre intersectadas com a estrutura `patient`
+depois de ela ser erodida em 0,5 cm. Se não existir uma ROI com o nome exato
+`patient` nos RTSTRUCTs selecionados, o programa informa a ausência e abre uma
+lista para escolher uma estrutura substituta; a estrutura escolhida também é
+erodida em 0,5 cm antes de limitar as margens. Se a erosão não deixar volume
+útil, escolha um limite anatômico mais amplo. A curva de união sem margem e
+as estruturas individuais não são recortadas por esse limite.
+
+As curvas são calculadas em intervalos de dose de 0,1 Gy. Ao passar o mouse
+sobre um gráfico, uma linha vertical e um rótulo mostram a dose; a legenda
+atualiza o volume percentual ou absoluto correspondente ao lado de cada nome
+de estrutura. A tabela `.csv` exportada usa ponto e vírgula como separador de
+campos e vírgula decimal, adequada às configurações brasileiras de planilhas;
+inclui dose em Gy, volume em cm³ e volume percentual. Use
+**Salvar gráficos DVH (2 PNG)** para salvar os dois gráficos em arquivos
+independentes, um com volume percentual e outro com volume absoluto.
+
+Os nomes de arquivo dos RTSTRUCTs não precisam coincidir. Se o Frame of
+Reference ou as referências de imagem estiverem ausentes ou divergirem, o
+programa ainda tenta associar os contornos às imagens CT pelas coordenadas
+físicas; essa situação gera um aviso no terminal, não um bloqueio. Confirme
+que os arquivos realmente estão no mesmo espaço físico antes de interpretar
+os resultados. Unidades relativas e séries com espaçamento irregular não são
+aceitas.
+As margens são expansões euclidianas em milímetros, considerando o espaçamento
+dos voxels e limitadas ao `patient` erodido. A ferramenta é para análise e revisão, não para decisão clínica:
+verifique a geometria, as unidades, o registro e os resultados em um sistema
+de planejamento/visualização apropriado antes de qualquer uso clínico.
+
+Quando os metadados anunciam Explicit VR, mas o conteúdo do arquivo está em
+Implicit VR, o aplicativo corrige a transferência para leitura como Implicit
+VR Little Endian e registra um aviso no terminal. Outros avisos do pydicom não
+são suprimidos. Arquivos DICOM sem preâmbulo nem prefixo `DICM` são lidos com
+tentativa forçada pelo pydicom; a deteção de tipo ainda é validada pelos
+metadados do arquivo. Se faltar também a Transfer Syntax, ela é inferida do
+encoding dos primeiros elementos DICOM para permitir a decodificação do RTDOSE.
+
+O processamento de leitura, visualização, DVH e exportação ocorre em segundo
+plano. O rodapé mostra a etapa atual, o percentual e uma barra de progresso
+determinate, atualizada durante a varredura da pasta, leitura da CT e
+rasterização das ROIs. A leitura da pasta filtra candidatos DICOM e ignora
+diretórios de ambientes Python/cache para evitar tentar abrir arquivos de
+pacotes como imagens. Inconsistências entre VR declarado e encontrado são
+corrigidas pela codificação observada no arquivo e agrupadas em um único
+registro informativo. Ao rasterizar RTSTRUCTs, contornos inválidos ou
+degenerados são ignorados com aviso no terminal; uma ROI sem nenhum contorno
+rasterizável gera erro explícito. Máscaras e malhas recentes são mantidas em
+cache limitado para reduzir o tempo ao alternar estruturas. A malha 3D é
+reduzida à resolução necessária para exibição interativa; os cálculos de DVH
+continuam usando as máscaras DICOM originais. A CT descoberta é carregada a
+partir dos caminhos DICOM indexados, sem nova varredura da pasta, e o RTDOSE é
+decodificado uma única vez por cálculo DVH. As estruturas são posicionadas nas
+coordenadas físicas da CT, incluindo a posição cranio-caudal. Para pontos sem
+dose definida dentro do RTDOSE, o programa não extrapola nem atribui dose
+artificial; não é exibido indicador de porcentagem de cobertura. Se nenhum
+voxel estiver coberto, o cálculo é interrompido. Quando o RTDOSE e a CT
+declaram Frame of Reference diferentes, a interpolação é tentada pelas
+coordenadas físicas numéricas, sem registro espacial; confirme que ambos estão
+no mesmo espaço físico antes de interpretar o DVH. A renderização é feita pela
+CPU do Matplotlib/scikit-image; não é usada GPU nesta versão.
+
+## 9. Opções, licenças, privacidade e limitações
 
 - Cada `-ta` seleciona uma tarefa/modelo diferente do TotalSegmentator.
   `--roi_subset` limita quais classes são segmentadas pela tarefa `total`;
@@ -360,7 +533,7 @@ impedem gerar o arquivo final.
   anatômicas) e escreve metadados para compatibilidade com o fluxo atual. O
   resultado consolidado não é uma cópia integral de todos os intermediários.
 
-## 9. Links oficiais e referências bibliográficas
+## 10. Links oficiais e referências bibliográficas
 
 ### Links
 
