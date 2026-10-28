@@ -437,9 +437,16 @@ com inclusão de pelo menos 60%, o primeiro início da análise precisa rasteriz
 temporariamente as ROIs da esquerda; apenas as escolhidas são mantidas em
 cache e preparadas para a visualização. A lista de percentuais é guardada para
 evitar repetir essa comparação quando as seleções não mudam. Após iniciar a
-análise, a visualização 3D mostra cada conjunto em seu próprio painel, sem
-rotação automática. Os eixos são ocultos, e a rotação manual em qualquer painel
-é sincronizada imediatamente com o outro. **Calcular DVH** abre uma janela
+análise, a visualização 3D mostra a auto-segmentação, a estrutura médica e uma
+terceira vista comparativa. Na comparação, o verde claro representa a
+interseção, o verde escuro o volume auto-segmentado fora da estrutura médica e
+o laranja o volume médico exclusivo. Não há rotação automática; os eixos são
+ocultos e a rotação manual em qualquer vista é sincronizada com as demais.
+**Tabela de métricas** abre uma tabela por ROI auto-segmentada com a porcentagem
+do seu volume dentro da união médica original e das expansões médicas de 0,5 e
+1,0 cm. A tabela também mostra o Dice percentual contra a união médica original
+(2 × interseção / soma dos volumes); 100% significa máscaras idênticas.
+**Calcular DVH** abre uma janela
 separada com gráficos de volume percentual e absoluto (cm³). O DVH inclui
 uma curva para cada estrutura auto-segmentada marcada, a união dessas
 estruturas, as margens de 0,5 cm e 1 cm e a união médica, identificada como

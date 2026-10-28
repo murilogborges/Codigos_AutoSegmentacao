@@ -106,6 +106,30 @@ class DvhBackendTests(unittest.TestCase):
             [("sixty", 0.6)],
         )
 
+    def test_structure_metrics_measure_medical_and_margin_containment(self):
+        class Series:
+            row_spacing = 1.0
+            column_spacing = 1.0
+            slice_spacing = 1.0
+
+        medical = np.zeros((21, 21, 21), dtype=bool)
+        medical[10, 10, 10] = True
+        auto = np.zeros_like(medical)
+        auto[10, 10, 10] = True
+        auto[11, 10, 10] = True
+        auto[14, 10, 10] = True
+        auto[18, 10, 10] = True
+
+        [metrics] = app.structure_comparison_metrics(
+            {"ROI_Auto": auto}, medical, Series()
+        )
+
+        self.assertEqual(metrics["structure"], "ROI_Auto")
+        self.assertAlmostEqual(metrics["inside_medical_percent"], 25.0)
+        self.assertAlmostEqual(metrics["inside_margin_05_percent"], 75.0)
+        self.assertAlmostEqual(metrics["inside_margin_10_percent"], 100.0)
+        self.assertAlmostEqual(metrics["dice_percent"], 40.0)
+
     def test_containment_failure_message_reports_best_overlap(self):
         message = app.containment_failure_message(
             {"Cervical": 0.4, "Thoracic": 0.0}
@@ -702,6 +726,60 @@ class DvhBackendTests(unittest.TestCase):
         self.assertEqual(medical_axes.elev, 31)
         self.assertEqual(medical_axes.azim, 123)
         self.assertEqual(medical_axes.roll, 17)
+
+    def test_draw_structure_3d_shows_overlap_and_exclusive_regions(self):
+        figure = app.Figure()
+        auto_axes = figure.add_subplot(1, 3, 1, projection="3d")
+        medical_axes = figure.add_subplot(1, 3, 2, projection="3d")
+        comparison_axes = figure.add_subplot(1, 3, 3, projection="3d")
+        auto = np.zeros((10, 10, 10), dtype=bool)
+        medical = np.zeros_like(auto)
+        auto[1:6, 1:6, 1:6] = True
+        medical[4:9, 4:9, 4:9] = True
+
+        app.draw_structure_3d(
+            auto_axes,
+            medical_axes,
+            auto,
+            medical,
+            None,
+            comparison_axes=comparison_axes,
+        )
+
+        self.assertEqual(comparison_axes.get_title(), "Sobreposição e diferenças")
+        self.assertEqual(len(comparison_axes.collections), 3)
+        self.assertEqual(
+            [text.get_text() for text in comparison_axes.get_legend().get_texts()],
+            [
+                "Auto-segmentação exclusiva",
+                "Sobreposição",
+                "Estrutura médica exclusiva",
+            ],
+        )
+        self.assertEqual(auto_axes.get_xlim(), comparison_axes.get_xlim())
+
+    def test_manual_rotation_is_synchronized_across_all_three_views(self):
+        figure = app.Figure()
+        axes = [figure.add_subplot(1, 3, index, projection="3d") for index in (1, 2, 3)]
+
+        class Canvas:
+            draw_calls = 0
+
+            def draw_idle(self):
+                self.draw_calls += 1
+
+        application = app.DvhApplication.__new__(app.DvhApplication)
+        application.ax_left_3d, application.ax_right_3d, application.ax_comparison_3d = axes
+        application.three_d_canvas = Canvas()
+        axes[2].view_init(elev=31, azim=123, roll=17)
+
+        application._sync_3d_views(SimpleNamespace(inaxes=axes[2]))
+
+        for target in axes[:2]:
+            self.assertEqual(target.elev, 31)
+            self.assertEqual(target.azim, 123)
+            self.assertEqual(target.roll, 17)
+        self.assertEqual(application.three_d_canvas.draw_calls, 1)
 
     def test_surface_mesh_uses_physical_cranial_caudal_position(self):
         from pydicom.dataset import Dataset

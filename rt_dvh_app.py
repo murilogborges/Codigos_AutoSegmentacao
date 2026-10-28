@@ -21,6 +21,7 @@ import pydicom
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.colors import to_rgba
+from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
@@ -665,6 +666,70 @@ def structure_containment_percentages(
     return percentages
 
 
+def structure_comparison_metrics(
+    auto_masks: dict[str, np.ndarray],
+    medical_mask: np.ndarray,
+    ct_series: CTSeries,
+    progress=None,
+) -> list[dict[str, float | str]]:
+    """Compare each auto ROI with the medical union and its 5/10 mm expansions."""
+    medical_mask = np.asarray(medical_mask, dtype=bool)
+    if any(np.asarray(mask).shape != medical_mask.shape for mask in auto_masks.values()):
+        raise ValueError("As máscaras das estruturas precisam ter a mesma grade.")
+
+    medical_volume = int(np.count_nonzero(medical_mask))
+    auto_volumes = {
+        name: int(np.count_nonzero(mask)) for name, mask in auto_masks.items()
+    }
+    overlaps = {
+        name: int(np.count_nonzero(mask & medical_mask))
+        for name, mask in auto_masks.items()
+    }
+    if progress:
+        progress(10, "Calculando a expansão médica de 0,5 cm")
+    medical_margin_05 = margin_mask(medical_mask, ct_series, 5.0)
+    inside_margin_05 = {
+        name: int(np.count_nonzero(mask & medical_margin_05))
+        for name, mask in auto_masks.items()
+    }
+    del medical_margin_05
+    if progress:
+        progress(55, "Calculando a expansão médica de 1,0 cm")
+    medical_margin_10 = margin_mask(medical_mask, ct_series, 10.0)
+    inside_margin_10 = {
+        name: int(np.count_nonzero(mask & medical_margin_10))
+        for name, mask in auto_masks.items()
+    }
+    del medical_margin_10
+    rows = []
+    for index, name in enumerate(auto_masks):
+        auto_volume = auto_volumes[name]
+        if auto_volume == 0:
+            within_medical = within_margin_05 = within_margin_10 = dice = 0.0
+        else:
+            overlap = overlaps[name]
+            within_medical = overlap / auto_volume * 100.0
+            within_margin_05 = inside_margin_05[name] / auto_volume * 100.0
+            within_margin_10 = inside_margin_10[name] / auto_volume * 100.0
+            dice_denominator = auto_volume + medical_volume
+            dice = 2.0 * overlap / dice_denominator * 100.0 if dice_denominator else 0.0
+        rows.append(
+            {
+                "structure": name,
+                "inside_medical_percent": within_medical,
+                "inside_margin_05_percent": within_margin_05,
+                "inside_margin_10_percent": within_margin_10,
+                "dice_percent": dice,
+            }
+        )
+        if progress:
+            progress(
+                70 + (index + 1) * 30 / max(1, len(auto_masks)),
+                f"Métricas concluídas: {name}",
+            )
+    return rows
+
+
 def containment_failure_message(
     percentages: dict[str, float], threshold: float = 0.6
 ) -> str:
@@ -943,6 +1008,10 @@ def draw_structure_3d(
     right_mask: np.ndarray | None,
     ct_series: CTSeries | None,
     prepared_surfaces: tuple[tuple[np.ndarray, np.ndarray] | None, ...] | None = None,
+    comparison_axes=None,
+    prepared_comparison_surfaces: tuple[
+        tuple[np.ndarray, np.ndarray] | None, ...
+    ] | None = None,
 ) -> None:
     masks = (left_mask, right_mask)
     if prepared_surfaces is None:
@@ -950,19 +1019,35 @@ def draw_structure_3d(
             _structure_surface(mask, ct_series) if mask is not None else None
             for mask in masks
         )
-    axes_and_masks = (
-        (left_axes, left_mask, "Auto-segmentação", "royalblue"),
-        (right_axes, right_mask, "Estrutura médica", "orangered"),
-    )
+    panels = [
+        (left_axes, "Auto-segmentação", [(prepared_surfaces[0], "royalblue")]),
+        (right_axes, "Estrutura médica", [(prepared_surfaces[1], "orangered")]),
+    ]
+    if comparison_axes is not None:
+        if prepared_comparison_surfaces is None:
+            prepared_comparison_surfaces = prepare_comparison_surfaces(
+                left_mask, right_mask, ct_series
+            )
+        comparison_colors = ("#176b3a", "#a8e6a3", "#e79a45")
+        panels.append(
+            (
+                comparison_axes,
+                "Sobreposição e diferenças",
+                list(zip(prepared_comparison_surfaces, comparison_colors)),
+            )
+        )
+
     surfaces = []
-    for (axes, mask, title, color), prepared in zip(axes_and_masks, prepared_surfaces):
+    for axes, title, groups in panels:
         axes.clear()
         axes.set_title(title)
         axes.set_axis_off()
-        if mask is None or not np.any(mask) or prepared is None:
-            continue
-        vertices, faces = prepared
-        surfaces.append((axes, vertices, faces, color))
+        for prepared, color in groups:
+            if prepared is None:
+                continue
+            vertices, faces = prepared
+            if len(vertices) and len(faces):
+                surfaces.append((axes, vertices, faces, color))
 
     if not surfaces:
         return
@@ -996,6 +1081,16 @@ def draw_structure_3d(
         axes.set_ylim(center[1] - radius, center[1] + radius)
         axes.set_zlim(center[2] - radius, center[2] + radius)
         axes.set_box_aspect((1, 1, 1))
+    if comparison_axes is not None:
+        comparison_axes.legend(
+            handles=[
+                Patch(facecolor="#176b3a", label="Auto-segmentação exclusiva"),
+                Patch(facecolor="#a8e6a3", label="Sobreposição"),
+                Patch(facecolor="#e79a45", label="Estrutura médica exclusiva"),
+            ],
+            loc="upper left",
+            fontsize="small",
+        )
 
 
 def prepare_structure_surfaces(
@@ -1007,6 +1102,35 @@ def prepare_structure_surfaces(
         _structure_surface(mask, ct_series) if mask is not None and np.any(mask) else None
         for mask in (left_mask, right_mask)
     )
+
+
+def prepare_comparison_surfaces(
+    left_mask: np.ndarray | None,
+    right_mask: np.ndarray | None,
+    ct_series: CTSeries | None,
+) -> tuple[tuple[np.ndarray, np.ndarray] | None, ...]:
+    if left_mask is None or right_mask is None:
+        return (None, None, None)
+    if left_mask.shape != right_mask.shape:
+        raise ValueError("As máscaras 3D precisam ter a mesma grade para comparação.")
+    region = np.empty(left_mask.shape, dtype=bool)
+    surfaces = []
+    for index, (exclusive_mask, included_mask) in enumerate(
+        (
+            (left_mask, right_mask),
+            (left_mask, right_mask),
+            (right_mask, left_mask),
+        )
+    ):
+        if index == 1:
+            np.logical_and(left_mask, right_mask, out=region)
+        else:
+            np.logical_not(included_mask, out=region)
+            np.logical_and(exclusive_mask, region, out=region)
+        surfaces.append(
+            _structure_surface(region, ct_series) if np.any(region) else None
+        )
+    return tuple(surfaces)
 
 
 def _structure_surface(
@@ -1300,6 +1424,7 @@ class DvhApplication:
         self.three_d_canvas: FigureCanvasTkAgg | None = None
         self.ax_left_3d = None
         self.ax_right_3d = None
+        self.ax_comparison_3d = None
         self.dvh_window: tk.Toplevel | None = None
         self.dvh_figure: Figure | None = None
         self.dvh_canvas: FigureCanvasTkAgg | None = None
@@ -1386,6 +1511,9 @@ class DvhApplication:
             side=tk.LEFT, padx=4, pady=4
         )
         ttk.Button(actions, text="Calcular DVH", command=self.calculate).pack(
+            side=tk.LEFT, padx=4, pady=4
+        )
+        ttk.Button(actions, text="Tabela de métricas", command=self.calculate_metrics).pack(
             side=tk.LEFT, padx=4, pady=4
         )
         ttk.Button(actions, text="Exportar DVH (.csv)", command=self.export).pack(
@@ -2012,9 +2140,15 @@ class DvhApplication:
                     right_mask, right_path, series_file.series_uid, right_names, ct_series
                 ),
             )
-            report(88, "Preparando superfícies 3D")
+            comparison_surfaces = None
+            if left_mask is not None and right_mask is not None:
+                report(78, "Preparando superfícies da sobreposição 3D")
+                comparison_surfaces = prepare_comparison_surfaces(
+                    left_mask, right_mask, ct_series
+                )
+            report(95, "Finalizando superfícies 3D")
             report(100, "Atualizando visualização")
-            return ct_series, left_mask, right_mask, surfaces
+            return ct_series, left_mask, right_mask, surfaces, comparison_surfaces
 
         def rendered(result):
             (
@@ -2022,8 +2156,9 @@ class DvhApplication:
                 left_mask,
                 right_mask,
                 surfaces,
+                comparison_surfaces,
             ) = result
-            self._draw_3d(left_mask, right_mask, surfaces)
+            self._draw_3d(left_mask, right_mask, surfaces, comparison_surfaces)
             self.status.configure(
                 text="Visualização atualizada; conjuntos em coordenadas físicas comuns."
             )
@@ -2118,6 +2253,9 @@ class DvhApplication:
         left_mask: np.ndarray | None,
         right_mask: np.ndarray | None,
         prepared_surfaces: tuple[tuple[np.ndarray, np.ndarray] | None, ...] | None = None,
+        prepared_comparison_surfaces: tuple[
+            tuple[np.ndarray, np.ndarray] | None, ...
+        ] | None = None,
     ) -> None:
         self._ensure_3d_window()
         draw_structure_3d(
@@ -2127,6 +2265,8 @@ class DvhApplication:
             right_mask,
             self.ct_series,
             prepared_surfaces,
+            self.ax_comparison_3d,
+            prepared_comparison_surfaces,
         )
         self.three_d_canvas.draw_idle()
 
@@ -2137,11 +2277,12 @@ class DvhApplication:
             return
         self.three_d_window = tk.Toplevel(self.root)
         self.three_d_window.title("Visualização 3D das estruturas")
-        self.three_d_window.geometry("1200x720")
+        self.three_d_window.geometry("1500x760")
         self.three_d_window.protocol("WM_DELETE_WINDOW", self._close_3d_window)
-        self.three_d_figure = Figure(figsize=(12, 7), dpi=110, constrained_layout=True)
-        self.ax_left_3d = self.three_d_figure.add_subplot(1, 2, 1, projection="3d")
-        self.ax_right_3d = self.three_d_figure.add_subplot(1, 2, 2, projection="3d")
+        self.three_d_figure = Figure(figsize=(16, 7), dpi=110, constrained_layout=True)
+        self.ax_left_3d = self.three_d_figure.add_subplot(1, 3, 1, projection="3d")
+        self.ax_right_3d = self.three_d_figure.add_subplot(1, 3, 2, projection="3d")
+        self.ax_comparison_3d = self.three_d_figure.add_subplot(1, 3, 3, projection="3d")
         self.three_d_canvas = FigureCanvasTkAgg(
             self.three_d_figure, master=self.three_d_window
         )
@@ -2156,6 +2297,7 @@ class DvhApplication:
         self.three_d_canvas = None
         self.ax_left_3d = None
         self.ax_right_3d = None
+        self.ax_comparison_3d = None
 
     def _ensure_dvh_window(self) -> None:
         if self.dvh_window is not None and self.dvh_window.winfo_exists():
@@ -2183,25 +2325,29 @@ class DvhApplication:
         self.ax_cc = None
 
     def _sync_3d_views(self, event) -> None:
-        if event.inaxes is self.ax_left_3d:
-            source_axes, target_axes = self.ax_left_3d, self.ax_right_3d
-        elif event.inaxes is self.ax_right_3d:
-            source_axes, target_axes = self.ax_right_3d, self.ax_left_3d
-        else:
+        axes = (self.ax_left_3d, self.ax_right_3d, self.ax_comparison_3d)
+        source_axes = event.inaxes
+        if source_axes not in axes:
             return
         source_view = (
             source_axes.elev,
             source_axes.azim,
             getattr(source_axes, "roll", 0),
         )
-        target_view = (
-            target_axes.elev,
-            target_axes.azim,
-            getattr(target_axes, "roll", 0),
-        )
-        if np.allclose(source_view, target_view, rtol=0, atol=1e-6):
+        changed = False
+        for target_axes in axes:
+            if target_axes is None or target_axes is source_axes:
+                continue
+            target_view = (
+                target_axes.elev,
+                target_axes.azim,
+                getattr(target_axes, "roll", 0),
+            )
+            if not np.allclose(source_view, target_view, rtol=0, atol=1e-6):
+                sync_3d_view(source_axes, target_axes)
+                changed = True
+        if not changed:
             return
-        sync_3d_view(source_axes, target_axes)
         self.three_d_canvas.draw_idle()
 
     def calculate(self) -> None:
@@ -2375,6 +2521,122 @@ class DvhApplication:
             loc="upper left" if axes is self.ax_cc else "best",
         )
         self.dvh_canvas.draw_idle()
+
+    def calculate_metrics(self) -> None:
+        try:
+            if self.folder is None or self.ct_combo.current() < 0:
+                raise ValueError("Selecione uma pasta e uma série CT.")
+            left_names = self.left_rois.get_selected()
+            right_names = self.right_rois.get_selected()
+            if not left_names or not right_names:
+                raise ValueError(
+                    "Selecione ao menos uma estrutura auto-segmentada e uma médica."
+                )
+            left_index, right_index = self.left_file.current(), self.right_file.current()
+            if not (0 <= left_index < len(self.rtstruct_files)) or not (
+                0 <= right_index < len(self.rtstruct_files)
+            ):
+                raise ValueError("Selecione os arquivos RTSTRUCT dos dois conjuntos.")
+            series_file = self.ct_files[self.ct_combo.current()]
+            left_path = self.rtstruct_files[left_index].path
+            right_path = self.rtstruct_files[right_index].path
+        except (ValueError, IndexError) as error:
+            messagebox.showerror("Erro ao calcular métricas", str(error))
+            return
+
+        def calculate_comparison(report):
+            ct_series = self.ct_series or load_ct_series(
+                self.folder,
+                series_file.series_uid,
+                series_file.instance_paths or None,
+                progress=lambda percent, message: report(percent * 0.2, message),
+            )
+            left_masks = self._cached_structure_masks(
+                ct_series,
+                left_path,
+                series_file.series_uid,
+                left_names,
+                progress=lambda percent, message: report(20 + percent * 0.34, message),
+            )
+            right_masks = self._cached_structure_masks(
+                ct_series,
+                right_path,
+                series_file.series_uid,
+                right_names,
+                progress=lambda percent, message: report(54 + percent * 0.34, message),
+            )
+            medical_union = np.logical_or.reduce(list(right_masks.values()))
+            report(88, "Calculando Dice e inclusão nas margens médicas")
+            rows = structure_comparison_metrics(
+                left_masks,
+                medical_union,
+                ct_series,
+                progress=lambda percent, message: report(
+                    88 + percent * 0.12, message
+                ),
+            )
+            report(100, "Tabela de métricas pronta")
+            return rows
+
+        def show_metrics(rows):
+            window = tk.Toplevel(self.root)
+            window.title("Métricas das estruturas auto-segmentadas")
+            window.geometry("1050x560")
+            ttk.Label(
+                window,
+                text=(
+                    "Inclusão = percentual do volume auto-segmentado dentro da união médica "
+                    "(ou da sua expansão de 5/10 mm). Dice compara a sobreposição com a "
+                    "união médica original; 100% indica máscaras idênticas."
+                ),
+                wraplength=1000,
+                justify=tk.LEFT,
+            ).pack(fill=tk.X, padx=10, pady=10)
+            columns = (
+                "structure",
+                "inside_medical",
+                "inside_05",
+                "inside_10",
+                "dice",
+            )
+            table_frame = ttk.Frame(window)
+            table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+            table = ttk.Treeview(
+                table_frame, columns=columns, show="headings", selectmode="browse"
+            )
+            headings = (
+                ("structure", "Estrutura auto-segmentada", 300),
+                ("inside_medical", "Dentro da médica (%)", 160),
+                ("inside_05", "Dentro da margem 0,5 cm (%)", 190),
+                ("inside_10", "Dentro da margem 1,0 cm (%)", 190),
+                ("dice", "Dice original (%)", 140),
+            )
+            for column, title, width in headings:
+                table.heading(column, text=title)
+                table.column(column, width=width, anchor="w" if column == "structure" else "center")
+            scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=table.yview)
+            table.configure(yscrollcommand=scrollbar.set)
+            table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            for row in rows:
+                table.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        row["structure"],
+                        f'{row["inside_medical_percent"]:.1f}',
+                        f'{row["inside_margin_05_percent"]:.1f}',
+                        f'{row["inside_margin_10_percent"]:.1f}',
+                        f'{row["dice_percent"]:.1f}',
+                    ),
+                )
+            self.status.configure(text="Tabela de métricas exibida.")
+
+        self._start_task(
+            "Calculando métricas das estruturas...",
+            calculate_comparison,
+            show_metrics,
+        )
 
     def export(self) -> None:
         if not self.curves:
