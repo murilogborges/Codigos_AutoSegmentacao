@@ -413,20 +413,21 @@ arquivos RTDOSE e os RTSTRUCTs encontrados; o seletor de imagem CT também
 mostra o nome do paciente lido dos metadados DICOM. Se a dose não estiver na
 pasta, use **Procurar RTDOSE...** para selecioná-la em outro local. Escolha
 explicitamente a imagem CT, a dose, o RTSTRUCT de auto-segmentação à esquerda
-e o RTSTRUCT médico à direita. Se existir um RTSTRUCT com nome começando por
+e o RTSTRUCT que contém os PTVs à direita. Se existir um RTSTRUCT com nome começando por
 `TOTAL_`, ele é selecionado por padrão para a auto-segmentação; um arquivo
-RTSTRUCT válido começando por `SS` é preferido para o conjunto médico.
+RTSTRUCT válido começando por `SS` é preferido para o conjunto dos PTVs.
 Se um arquivo não aparecer na lista, use **Abrir RTSTRUCT...** junto ao seletor
 correspondente para carregá-lo manualmente, independentemente do nome/prefixo
 do arquivo. Estruturas com `Isocenter` no nome são removidas dos seletores.
 Os dois painéis de estruturas usam caixas de seleção individuais e barra de
-rolagem. No painel médico, todas as ROIs contendo `PTV` no nome são
+rolagem. No painel dos PTVs, todas as ROIs contendo `PTV` no nome são
 pré-selecionadas quando disponíveis. Se nenhuma ROI contiver `PTV`, nenhuma
-estrutura é selecionada automaticamente: escolha manualmente a(s) estrutura(s)
-médica(s). Após configurar os seletores, clique **Iniciar análise 3D**. A
-visualização será aberta em uma janela separada. Só então o programa verifica
-quais ROIs da auto-segmentação têm pelo menos 60%
-do volume dentro da união médica e pergunta se deseja selecioná-las. Você pode
+estrutura é selecionada automaticamente: escolha manualmente a(s) ROI(s) de
+PTV. Após configurar os seletores, clique **Iniciar análise 3D**. O programa
+processa as estruturas primeiro; a janela 3D só é aberta ou exibida quando o
+processamento das superfícies termina. Em seguida, verifica quais ROIs da
+auto-segmentação têm pelo menos 60% do volume dentro da união dos PTVs
+selecionados e pergunta se deseja selecioná-las. Você pode
 aceitar a sugestão e depois ajustar as caixas da esquerda, ou recusá-la e
 manter sua seleção manual. Se nenhuma atingir 60%, o aplicativo informa as
 maiores porcentagens de inclusão; se todas forem zero, orienta verificar
@@ -437,20 +438,24 @@ com inclusão de pelo menos 60%, o primeiro início da análise precisa rasteriz
 temporariamente as ROIs da esquerda; apenas as escolhidas são mantidas em
 cache e preparadas para a visualização. A lista de percentuais é guardada para
 evitar repetir essa comparação quando as seleções não mudam. Após iniciar a
-análise, a visualização 3D mostra a auto-segmentação, a estrutura médica e uma
-terceira vista comparativa. Na comparação, o verde claro representa a
-interseção, o verde escuro o volume auto-segmentado fora da estrutura médica e
-o laranja o volume médico exclusivo. Não há rotação automática; os eixos são
+análise, a visualização 3D mostra a auto-segmentação à esquerda, a comparação no
+centro e os PTVs à direita. Na comparação, o verde claro representa a
+interseção, o verde escuro o volume auto-segmentado fora dos PTVs e o laranja o
+volume dos PTVs exclusivo. Não há legenda nem rotação automática; os eixos são
 ocultos e a rotação manual em qualquer vista é sincronizada com as demais.
-**Tabela de métricas** abre uma tabela por ROI auto-segmentada com a porcentagem
-do seu volume dentro da união médica original e das expansões médicas de 0,5 e
-1,0 cm. A tabela também mostra o Dice percentual contra a união médica original
-(2 × interseção / soma dos volumes); 100% significa máscaras idênticas.
-**Calcular DVH** abre uma janela
-separada com gráficos de volume percentual e absoluto (cm³). O DVH inclui
-uma curva para cada estrutura auto-segmentada marcada, a união dessas
-estruturas, as margens de 0,5 cm e 1 cm e a união médica, identificada como
-**PTV Original**.
+**Tabela de métricas** abre uma tabela por ROI auto-segmentada: “Dentro do PTV”
+é a porcentagem do volume da ROI automática contida na união dos PTVs
+selecionados. As colunas de margem expandem cada ROI auto-segmentada
+individualmente em 0,5 cm e 1,0 cm e mostram qual porcentagem do volume dos PTVs
+fica coberta por essa expansão; as margens não são aplicadas aos PTVs. A tabela
+também mostra o Dice percentual entre a ROI automática original e a união dos
+PTVs (2 × interseção / soma dos volumes); 100% significa máscaras idênticas.
+**Calcular DVH** abre uma janela separada com gráficos de volume percentual e
+absoluto (cm³). O DVH inclui uma curva para cada estrutura auto-segmentada
+marcada, a união dessas estruturas, expansões de 0,5 cm e 1 cm da união
+auto-segmentada e a união dos PTVs, identificada como **PTV Original**. Assim
+como na tabela, essas margens partem das estruturas auto-segmentadas, não dos
+PTVs; para o DVH, continuam limitadas à estrutura `patient` erodida em 0,5 cm.
 
 As estruturas com margem são sempre intersectadas com a estrutura `patient`
 depois de ela ser erodida em 0,5 cm. Se não existir uma ROI com o nome exato

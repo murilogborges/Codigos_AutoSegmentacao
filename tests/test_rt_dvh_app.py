@@ -38,7 +38,7 @@ def _new_file(path, sop_class, modality):
 class DvhBackendTests(unittest.TestCase):
     def test_default_rtstruct_prefers_total_left_and_valid_ss_right(self):
         files = [
-            app.DicomFile(Path("medical.dcm"), "", ""),
+            app.DicomFile(Path("ptv.dcm"), "", ""),
             app.DicomFile(Path("TOTAL_auto.dcm"), "", ""),
             app.DicomFile(Path("SS_review.dcm"), "", ""),
         ]
@@ -106,29 +106,49 @@ class DvhBackendTests(unittest.TestCase):
             [("sixty", 0.6)],
         )
 
-    def test_structure_metrics_measure_medical_and_margin_containment(self):
+    def test_structure_metrics_use_auto_roi_margins_to_measure_ptv_coverage(self):
         class Series:
             row_spacing = 1.0
             column_spacing = 1.0
             slice_spacing = 1.0
 
-        medical = np.zeros((21, 21, 21), dtype=bool)
-        medical[10, 10, 10] = True
-        auto = np.zeros_like(medical)
-        auto[10, 10, 10] = True
-        auto[11, 10, 10] = True
-        auto[14, 10, 10] = True
-        auto[18, 10, 10] = True
+        ptv = np.zeros((31, 31, 31), dtype=bool)
+        ptv[10:20, 10, 10] = True
+        overlap = np.zeros_like(ptv)
+        overlap[8, 10, 10] = True
+        overlap[10, 10, 10] = True
+        overlap[11, 10, 10] = True
+        overlap[12, 10, 10] = True
+        near = np.zeros_like(ptv)
+        near[14, 10, 10] = True
+        far = np.zeros_like(ptv)
+        far[24, 10, 10] = True
 
-        [metrics] = app.structure_comparison_metrics(
-            {"ROI_Auto": auto}, medical, Series()
+        metrics = app.structure_comparison_metrics(
+            {"ROI_Auto": overlap, "Near": near, "Far": far}, ptv, Series()
         )
 
-        self.assertEqual(metrics["structure"], "ROI_Auto")
-        self.assertAlmostEqual(metrics["inside_medical_percent"], 25.0)
-        self.assertAlmostEqual(metrics["inside_margin_05_percent"], 75.0)
-        self.assertAlmostEqual(metrics["inside_margin_10_percent"], 100.0)
-        self.assertAlmostEqual(metrics["dice_percent"], 40.0)
+        overlap_metrics, near_metrics, far_metrics = metrics
+        self.assertEqual(overlap_metrics["structure"], "ROI_Auto")
+        self.assertAlmostEqual(overlap_metrics["inside_ptv_percent"], 75.0)
+        self.assertAlmostEqual(
+            overlap_metrics["ptv_inside_auto_margin_05_percent"], 80.0
+        )
+        self.assertAlmostEqual(
+            overlap_metrics["ptv_inside_auto_margin_10_percent"], 100.0
+        )
+        self.assertAlmostEqual(overlap_metrics["dice_percent"], 600 / 14)
+        self.assertAlmostEqual(near_metrics["inside_ptv_percent"], 100.0)
+        self.assertAlmostEqual(
+            near_metrics["ptv_inside_auto_margin_05_percent"], 100.0
+        )
+        self.assertAlmostEqual(far_metrics["inside_ptv_percent"], 0.0)
+        self.assertAlmostEqual(
+            far_metrics["ptv_inside_auto_margin_05_percent"], 10.0
+        )
+        self.assertAlmostEqual(
+            far_metrics["ptv_inside_auto_margin_10_percent"], 60.0
+        )
 
     def test_containment_failure_message_reports_best_overlap(self):
         message = app.containment_failure_message(
@@ -703,45 +723,45 @@ class DvhBackendTests(unittest.TestCase):
         self.assertTrue(any("Auto" in line for line in logged.output))
         np.testing.assert_array_equal(masks["Auto"], masks_without_references["Auto"])
 
-    def test_auto_and_medical_masks_are_drawn_in_separate_3d_axes(self):
+    def test_auto_and_ptv_masks_are_drawn_in_separate_3d_axes(self):
         figure = app.Figure()
         auto_axes = figure.add_subplot(1, 2, 1, projection="3d")
-        medical_axes = figure.add_subplot(1, 2, 2, projection="3d")
+        ptv_axes = figure.add_subplot(1, 2, 2, projection="3d")
         auto_mask = np.zeros((4, 4, 4), dtype=bool)
-        medical_mask = np.zeros_like(auto_mask)
+        ptv_mask = np.zeros_like(auto_mask)
         auto_mask[1, 1, 1] = True
-        medical_mask[2, 2, 2] = True
+        ptv_mask[2, 2, 2] = True
 
-        app.draw_structure_3d(auto_axes, medical_axes, auto_mask, medical_mask, None)
+        app.draw_structure_3d(auto_axes, ptv_axes, auto_mask, ptv_mask, None)
 
         self.assertEqual(auto_axes.get_title(), "Auto-segmentação")
-        self.assertEqual(medical_axes.get_title(), "Estrutura médica")
+        self.assertEqual(ptv_axes.get_title(), "PTV")
         self.assertFalse(auto_axes.axison)
-        self.assertFalse(medical_axes.axison)
+        self.assertFalse(ptv_axes.axison)
         self.assertTrue(auto_axes.collections)
-        self.assertTrue(medical_axes.collections)
-        self.assertEqual(auto_axes.get_zlim(), medical_axes.get_zlim())
+        self.assertTrue(ptv_axes.collections)
+        self.assertEqual(auto_axes.get_zlim(), ptv_axes.get_zlim())
         auto_axes.view_init(elev=31, azim=123, roll=17)
-        app.sync_3d_view(auto_axes, medical_axes)
-        self.assertEqual(medical_axes.elev, 31)
-        self.assertEqual(medical_axes.azim, 123)
-        self.assertEqual(medical_axes.roll, 17)
+        app.sync_3d_view(auto_axes, ptv_axes)
+        self.assertEqual(ptv_axes.elev, 31)
+        self.assertEqual(ptv_axes.azim, 123)
+        self.assertEqual(ptv_axes.roll, 17)
 
-    def test_draw_structure_3d_shows_overlap_and_exclusive_regions(self):
+    def test_draw_structure_3d_shows_center_overlap_without_legend(self):
         figure = app.Figure()
         auto_axes = figure.add_subplot(1, 3, 1, projection="3d")
-        medical_axes = figure.add_subplot(1, 3, 2, projection="3d")
-        comparison_axes = figure.add_subplot(1, 3, 3, projection="3d")
+        comparison_axes = figure.add_subplot(1, 3, 2, projection="3d")
+        ptv_axes = figure.add_subplot(1, 3, 3, projection="3d")
         auto = np.zeros((10, 10, 10), dtype=bool)
-        medical = np.zeros_like(auto)
+        ptv = np.zeros_like(auto)
         auto[1:6, 1:6, 1:6] = True
-        medical[4:9, 4:9, 4:9] = True
+        ptv[4:9, 4:9, 4:9] = True
 
         app.draw_structure_3d(
             auto_axes,
-            medical_axes,
+            ptv_axes,
             auto,
-            medical,
+            ptv,
             None,
             comparison_axes=comparison_axes,
         )
@@ -749,14 +769,18 @@ class DvhBackendTests(unittest.TestCase):
         self.assertEqual(comparison_axes.get_title(), "Sobreposição e diferenças")
         self.assertEqual(len(comparison_axes.collections), 3)
         self.assertEqual(
-            [text.get_text() for text in comparison_axes.get_legend().get_texts()],
-            [
-                "Auto-segmentação exclusiva",
-                "Sobreposição",
-                "Estrutura médica exclusiva",
-            ],
+            comparison_axes.get_legend(),
+            None,
         )
         self.assertEqual(auto_axes.get_xlim(), comparison_axes.get_xlim())
+        self.assertLess(
+            comparison_axes.get_position().x0,
+            ptv_axes.get_position().x0,
+        )
+        self.assertLess(
+            auto_axes.get_position().x0,
+            comparison_axes.get_position().x0,
+        )
 
     def test_manual_rotation_is_synchronized_across_all_three_views(self):
         figure = app.Figure()
@@ -812,15 +836,15 @@ class DvhBackendTests(unittest.TestCase):
 
         figure = app.Figure()
         auto_axes = figure.add_subplot(1, 2, 1, projection="3d")
-        medical_axes = figure.add_subplot(1, 2, 2, projection="3d")
+        ptv_axes = figure.add_subplot(1, 2, 2, projection="3d")
         app.draw_structure_3d(
             auto_axes,
-            medical_axes,
+            ptv_axes,
             cervical_thoracic,
             lumbar,
             ct_series,
         )
-        self.assertEqual(auto_axes.get_zlim(), medical_axes.get_zlim())
+        self.assertEqual(auto_axes.get_zlim(), ptv_axes.get_zlim())
         self.assertLess(auto_axes.get_zlim()[0], lower_vertices[:, 2].min())
         self.assertGreater(auto_axes.get_zlim()[1], upper_vertices[:, 2].max())
 

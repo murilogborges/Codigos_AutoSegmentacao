@@ -21,7 +21,6 @@ import pydicom
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.colors import to_rgba
-from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from pydicom.dataset import Dataset
 from pydicom.errors import InvalidDicomError
@@ -620,11 +619,11 @@ def choose_default_rtstructs(files: list[DicomFile]) -> tuple[int, int]:
         (index for index, item in enumerate(files) if item.path.name.upper().startswith("TOTAL_")),
         0,
     )
-    medical_index = next(
+    ptv_index = next(
         (index for index, item in enumerate(files) if item.path.name.upper().startswith("SS")),
         next((index for index in range(len(files)) if index != auto_index), auto_index),
     )
-    return auto_index, medical_index
+    return auto_index, ptv_index
 
 
 def preferred_ptv_indices(roi_names: list[str]) -> list[int]:
@@ -668,63 +667,56 @@ def structure_containment_percentages(
 
 def structure_comparison_metrics(
     auto_masks: dict[str, np.ndarray],
-    medical_mask: np.ndarray,
+    ptv_mask: np.ndarray,
     ct_series: CTSeries,
     progress=None,
 ) -> list[dict[str, float | str]]:
-    """Compare each auto ROI with the medical union and its 5/10 mm expansions."""
-    medical_mask = np.asarray(medical_mask, dtype=bool)
-    if any(np.asarray(mask).shape != medical_mask.shape for mask in auto_masks.values()):
+    """Measure auto-ROI inclusion in the PTV and PTV coverage by auto-ROI margins."""
+    ptv_mask = np.asarray(ptv_mask, dtype=bool)
+    if any(np.asarray(mask).shape != ptv_mask.shape for mask in auto_masks.values()):
         raise ValueError("As máscaras das estruturas precisam ter a mesma grade.")
 
-    medical_volume = int(np.count_nonzero(medical_mask))
-    auto_volumes = {
-        name: int(np.count_nonzero(mask)) for name, mask in auto_masks.items()
-    }
-    overlaps = {
-        name: int(np.count_nonzero(mask & medical_mask))
-        for name, mask in auto_masks.items()
-    }
-    if progress:
-        progress(10, "Calculando a expansão médica de 0,5 cm")
-    medical_margin_05 = margin_mask(medical_mask, ct_series, 5.0)
-    inside_margin_05 = {
-        name: int(np.count_nonzero(mask & medical_margin_05))
-        for name, mask in auto_masks.items()
-    }
-    del medical_margin_05
-    if progress:
-        progress(55, "Calculando a expansão médica de 1,0 cm")
-    medical_margin_10 = margin_mask(medical_mask, ct_series, 10.0)
-    inside_margin_10 = {
-        name: int(np.count_nonzero(mask & medical_margin_10))
-        for name, mask in auto_masks.items()
-    }
-    del medical_margin_10
+    ptv_volume = int(np.count_nonzero(ptv_mask))
+    if ptv_volume == 0:
+        raise ValueError("A união dos PTVs selecionados não contém voxels.")
     rows = []
     for index, name in enumerate(auto_masks):
-        auto_volume = auto_volumes[name]
+        auto_mask = np.asarray(auto_masks[name], dtype=bool)
+        auto_volume = int(np.count_nonzero(auto_mask))
         if auto_volume == 0:
-            within_medical = within_margin_05 = within_margin_10 = dice = 0.0
+            within_ptv = ptv_within_margin_05 = ptv_within_margin_10 = dice = 0.0
         else:
-            overlap = overlaps[name]
-            within_medical = overlap / auto_volume * 100.0
-            within_margin_05 = inside_margin_05[name] / auto_volume * 100.0
-            within_margin_10 = inside_margin_10[name] / auto_volume * 100.0
-            dice_denominator = auto_volume + medical_volume
+            overlap = int(np.count_nonzero(auto_mask & ptv_mask))
+            within_ptv = overlap / auto_volume * 100.0
+            margin_05 = margin_mask(auto_mask, ct_series, 5.0)
+            ptv_within_margin_05 = (
+                int(np.count_nonzero(ptv_mask & margin_05)) / ptv_volume * 100.0
+            )
+            del margin_05
+            if progress:
+                progress(
+                    (index + 0.5) * 100 / max(1, len(auto_masks)),
+                    f"Calculando margem de 0,5 cm: {name}",
+                )
+            margin_10 = margin_mask(auto_mask, ct_series, 10.0)
+            ptv_within_margin_10 = (
+                int(np.count_nonzero(ptv_mask & margin_10)) / ptv_volume * 100.0
+            )
+            del margin_10
+            dice_denominator = auto_volume + ptv_volume
             dice = 2.0 * overlap / dice_denominator * 100.0 if dice_denominator else 0.0
         rows.append(
             {
                 "structure": name,
-                "inside_medical_percent": within_medical,
-                "inside_margin_05_percent": within_margin_05,
-                "inside_margin_10_percent": within_margin_10,
+                "inside_ptv_percent": within_ptv,
+                "ptv_inside_auto_margin_05_percent": ptv_within_margin_05,
+                "ptv_inside_auto_margin_10_percent": ptv_within_margin_10,
                 "dice_percent": dice,
             }
         )
         if progress:
             progress(
-                70 + (index + 1) * 30 / max(1, len(auto_masks)),
+                (index + 1) * 100 / max(1, len(auto_masks)),
                 f"Métricas concluídas: {name}",
             )
     return rows
@@ -740,7 +732,7 @@ def containment_failure_message(
         f"Foram verificadas {len(percentages)} estrutura(s) da auto-segmentação. "
         f"Nenhuma alcançou o limite de {threshold:.0%}. "
         "O percentual é a fração do volume de cada estrutura à esquerda que "
-        "sobrepõe a união das estruturas médicas selecionadas."
+        "está dentro da união dos PTVs selecionados."
     )
     if not ranked:
         return message + "\nNenhuma estrutura candidata foi encontrada."
@@ -1021,7 +1013,7 @@ def draw_structure_3d(
         )
     panels = [
         (left_axes, "Auto-segmentação", [(prepared_surfaces[0], "royalblue")]),
-        (right_axes, "Estrutura médica", [(prepared_surfaces[1], "orangered")]),
+        (right_axes, "PTV", [(prepared_surfaces[1], "orangered")]),
     ]
     if comparison_axes is not None:
         if prepared_comparison_surfaces is None:
@@ -1081,18 +1073,6 @@ def draw_structure_3d(
         axes.set_ylim(center[1] - radius, center[1] + radius)
         axes.set_zlim(center[2] - radius, center[2] + radius)
         axes.set_box_aspect((1, 1, 1))
-    if comparison_axes is not None:
-        comparison_axes.legend(
-            handles=[
-                Patch(facecolor="#176b3a", label="Auto-segmentação exclusiva"),
-                Patch(facecolor="#a8e6a3", label="Sobreposição"),
-                Patch(facecolor="#e79a45", label="Estrutura médica exclusiva"),
-            ],
-            loc="upper left",
-            fontsize="small",
-        )
-
-
 def prepare_structure_surfaces(
     left_mask: np.ndarray | None,
     right_mask: np.ndarray | None,
@@ -1474,7 +1454,7 @@ class DvhApplication:
         self.left_file = ttk.Combobox(controls, state="readonly", width=52)
         self.left_file.grid(row=2, column=1, sticky="ew", padx=4)
         self.left_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
-        ttk.Label(controls, text="Médica (direita):").grid(row=2, column=2, sticky="e", padx=4)
+        ttk.Label(controls, text="PTV (direita):").grid(row=2, column=2, sticky="e", padx=4)
         self.right_file = ttk.Combobox(controls, state="readonly", width=52)
         self.right_file.grid(row=2, column=3, sticky="ew", padx=4)
         self.right_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
@@ -1494,7 +1474,7 @@ class DvhApplication:
         self.left_rois = ROISelectionPanel(left_selection, on_change=None, height=320)
         self.left_rois.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         right_selection = ttk.LabelFrame(
-            selection_controls, text="Médica: PTV é pré-selecionado quando encontrado"
+            selection_controls, text="PTV: marque as estruturas de referência desejadas"
         )
         right_selection.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=4)
         self.right_rois = ROISelectionPanel(right_selection, on_change=None, height=320)
@@ -1643,7 +1623,7 @@ class DvhApplication:
         self, left_path: Path, right_path: Path
     ) -> tuple[Path, str] | None:
         options = [
-            (right_path, name, "RTSTRUCT médico")
+            (right_path, name, "RTSTRUCT do PTV")
             for name in self.right_rois.get_items()
         ] + [
             (left_path, name, "RTSTRUCT auto-segmentação")
@@ -1935,9 +1915,9 @@ class DvhApplication:
                 "Seleção necessária",
                 (
                     "Nenhuma estrutura PTV foi encontrada. Marque manualmente "
-                    "uma ou mais estruturas médicas antes de iniciar."
+                    "um ou mais PTVs antes de iniciar."
                     if no_ptv
-                    else "Marque uma ou mais estruturas médicas antes de iniciar."
+                    else "Marque um ou mais PTVs antes de iniciar."
                 ),
             )
             return
@@ -2021,7 +2001,7 @@ class DvhApplication:
                 accepted = messagebox.askyesno(
                     "Confirmar estruturas auto-segmentadas",
                     "Estas estruturas estão pelo menos 60% dentro da união das "
-                    "estruturas médicas selecionadas:\n\n"
+                    "PTVs selecionados:\n\n"
                     f"{description}\n\n"
                     "Deseja selecioná-las para a análise?",
                 )
@@ -2047,7 +2027,8 @@ class DvhApplication:
             )
             self._render_selected_3d()
 
-        self._ensure_3d_window()
+        if self.three_d_window is not None and self.three_d_window.winfo_exists():
+            self.three_d_window.withdraw()
         self._start_task(
             "Iniciando análise: verificando estruturas selecionadas...",
             find_contained,
@@ -2281,8 +2262,8 @@ class DvhApplication:
         self.three_d_window.protocol("WM_DELETE_WINDOW", self._close_3d_window)
         self.three_d_figure = Figure(figsize=(16, 7), dpi=110, constrained_layout=True)
         self.ax_left_3d = self.three_d_figure.add_subplot(1, 3, 1, projection="3d")
-        self.ax_right_3d = self.three_d_figure.add_subplot(1, 3, 2, projection="3d")
-        self.ax_comparison_3d = self.three_d_figure.add_subplot(1, 3, 3, projection="3d")
+        self.ax_comparison_3d = self.three_d_figure.add_subplot(1, 3, 2, projection="3d")
+        self.ax_right_3d = self.three_d_figure.add_subplot(1, 3, 3, projection="3d")
         self.three_d_canvas = FigureCanvasTkAgg(
             self.three_d_figure, master=self.three_d_window
         )
@@ -2361,7 +2342,7 @@ class DvhApplication:
             right_names = self.right_rois.get_selected()
             if not left_names or not right_names:
                 raise ValueError(
-                    "Selecione uma ou mais estruturas de auto-segmentação e uma ou mais médicas."
+                    "Selecione uma ou mais estruturas de auto-segmentação e um ou mais PTVs."
                 )
             if not (0 <= left_index < len(self.rtstruct_files)) or not (
                 0 <= right_index < len(self.rtstruct_files)
@@ -2530,7 +2511,7 @@ class DvhApplication:
             right_names = self.right_rois.get_selected()
             if not left_names or not right_names:
                 raise ValueError(
-                    "Selecione ao menos uma estrutura auto-segmentada e uma médica."
+                    "Selecione ao menos uma estrutura auto-segmentada e um ou mais PTVs."
                 )
             left_index, right_index = self.left_file.current(), self.right_file.current()
             if not (0 <= left_index < len(self.rtstruct_files)) or not (
@@ -2565,11 +2546,11 @@ class DvhApplication:
                 right_names,
                 progress=lambda percent, message: report(54 + percent * 0.34, message),
             )
-            medical_union = np.logical_or.reduce(list(right_masks.values()))
-            report(88, "Calculando Dice e inclusão nas margens médicas")
+            ptv_union = np.logical_or.reduce(list(right_masks.values()))
+            report(88, "Calculando Dice e inclusão no PTV; margens das estruturas automáticas")
             rows = structure_comparison_metrics(
                 left_masks,
-                medical_union,
+                ptv_union,
                 ct_series,
                 progress=lambda percent, message: report(
                     88 + percent * 0.12, message
@@ -2585,18 +2566,20 @@ class DvhApplication:
             ttk.Label(
                 window,
                 text=(
-                    "Inclusão = percentual do volume auto-segmentado dentro da união médica "
-                    "(ou da sua expansão de 5/10 mm). Dice compara a sobreposição com a "
-                    "união médica original; 100% indica máscaras idênticas."
+                    "Dentro do PTV = percentual do volume auto-segmentado contido na união "
+                    "dos PTVs selecionados. Nas colunas de margem, a expansão de 0,5/1,0 cm "
+                    "é aplicada individualmente à estrutura auto-segmentada; o valor indica "
+                    "o percentual do PTV coberto por essa expansão. Dice compara as máscaras "
+                    "originais; 100% indica máscaras idênticas."
                 ),
                 wraplength=1000,
                 justify=tk.LEFT,
             ).pack(fill=tk.X, padx=10, pady=10)
             columns = (
                 "structure",
-                "inside_medical",
-                "inside_05",
-                "inside_10",
+                "inside_ptv",
+                "ptv_inside_auto_margin_05",
+                "ptv_inside_auto_margin_10",
                 "dice",
             )
             table_frame = ttk.Frame(window)
@@ -2606,9 +2589,9 @@ class DvhApplication:
             )
             headings = (
                 ("structure", "Estrutura auto-segmentada", 300),
-                ("inside_medical", "Dentro da médica (%)", 160),
-                ("inside_05", "Dentro da margem 0,5 cm (%)", 190),
-                ("inside_10", "Dentro da margem 1,0 cm (%)", 190),
+                ("inside_ptv", "Dentro do PTV (%)", 160),
+                ("ptv_inside_auto_margin_05", "PTV na margem auto 0,5 cm (%)", 200),
+                ("ptv_inside_auto_margin_10", "PTV na margem auto 1,0 cm (%)", 200),
                 ("dice", "Dice original (%)", 140),
             )
             for column, title, width in headings:
@@ -2624,9 +2607,9 @@ class DvhApplication:
                     tk.END,
                     values=(
                         row["structure"],
-                        f'{row["inside_medical_percent"]:.1f}',
-                        f'{row["inside_margin_05_percent"]:.1f}',
-                        f'{row["inside_margin_10_percent"]:.1f}',
+                        f'{row["inside_ptv_percent"]:.1f}',
+                        f'{row["ptv_inside_auto_margin_05_percent"]:.1f}',
+                        f'{row["ptv_inside_auto_margin_10_percent"]:.1f}',
                         f'{row["dice_percent"]:.1f}',
                     ),
                 )
