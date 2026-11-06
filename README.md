@@ -618,6 +618,28 @@ PDF. A exportação PDF requer `reportlab`:
 python3 -m pip install reportlab
 ```
 
+Depois de selecionar os RTSTRUCTs, é possível selecionar um arquivo DICOM
+RTDOSE. O relatório passa a incluir a dose média (Gy) e D0,5cc para cada
+estrutura. O RTDOSE precisa conter dose absoluta em Gy ou cGy e cobrir
+integralmente cada estrutura; caso contrário, o cálculo é recusado para evitar
+métricas parciais. Se os Frames of Reference forem diferentes, o cálculo
+prossegue usando diretamente as coordenadas físicas e não aplica registro
+espacial. A tabela `Resultados` do PDF inclui a dose média
+e D0,5cc em Gy para cada estrutura, junto às demais métricas. A dose média é
+ponderada pelo volume dos voxels. D0,5cc é a dose no volume mais quente de
+0,5 cm³ e fica indisponível para estruturas menores que esse volume. Os valores
+representam somente o RTDOSE selecionado e seu `DoseSummationType`; não há soma
+automática de arquivos ou frações. Quando a ROI `Área cardíaca` está presente,
+a janela de resultados e o PDF incluem os constraints cardíacos do RTOG 1005,
+com indicadores PASSA/NÃO PASSA para os critérios ideal e aceitável. A
+lateralidade é inferida pela estrutura mamária com maior dose média; se não
+houver estrutura mamária lateralizada ou houver empate, os constraints ficam
+como NÃO AVALIADO. Todos os volumes V8/V16/V20 são medidos exclusivamente na
+estrutura `Área cardíaca`; a lateralidade mamária define somente quais limites
+do protocolo são comparados. A comparação usa os limiares do Arm II: V16 Gy ideal e
+V20 Gy aceitável no constraint 1; V8 Gy no constraint 2. Os indicadores são
+auxiliares e não substituem a revisão do protocolo e do contexto clínico.
+
 O PDF é salvo em orientação retrato e inclui a data do estudo da tomografia
 (priorizando `StudyDate` e usando datas DICOM alternativas se necessário) e
 a data local da geração do relatório. A janela de salvamento abre inicialmente
@@ -626,7 +648,10 @@ que zero, o relatório acrescenta uma página com um recorte físico de 10 × 10
 do corte, mostrando até os três agrupamentos calcificados com maior
 contribuição ao score. No mesmo corte axial, os centros dos agrupamentos
 selecionados ficam separados por mais de 0,5 cm. O contorno vermelho delimita
-a estrutura analisada.
+a estrutura analisada. Quando houver RTDOSE, as imagens também mostram linhas
+contínuas de isodose iniciando em 1 Gy e avançando de 5 em 5 Gy, com uma legenda
+no rodapé de cada página de calcificações. Após salvar, use **Abrir PDF gerado**
+para abrir diretamente o último relatório criado no aplicativo.
 
 Os nomes conhecidos `myocardium`, `atrium_left`, `ventricle_left`,
 `atrium_right`, `ventricle_right`, `aorta` e `pulmonary_artery` são exibidos em

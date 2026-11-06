@@ -13,6 +13,7 @@ from pydicom.sequence import Sequence
 from pydicom.uid import (
     CTImageStorage,
     ExplicitVRLittleEndian,
+    RTDoseStorage,
     RTStructureSetStorage,
     generate_uid,
 )
@@ -92,6 +93,42 @@ def _write_rtstruct(path, series_uid, frame_uid, contour_data, roi_name="coronar
     return dataset
 
 
+def _write_rt_dose(
+    path,
+    frame_uid,
+    pixels,
+    units="GY",
+    scaling=1.0,
+    origin=(0, 0, 0),
+    frame_offsets=None,
+):
+    dataset = _new_file(path, RTDoseStorage, "RTDOSE")
+    pixels = np.asarray(pixels, dtype="<u2")
+    dataset.FrameOfReferenceUID = frame_uid
+    dataset.DoseUnits = units
+    dataset.DoseType = "PHYSICAL"
+    dataset.DoseSummationType = "PLAN"
+    dataset.DoseGridScaling = scaling
+    dataset.NumberOfFrames = pixels.shape[0]
+    dataset.Rows = pixels.shape[1]
+    dataset.Columns = pixels.shape[2]
+    dataset.ImagePositionPatient = list(origin)
+    dataset.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
+    dataset.PixelSpacing = [10, 10]
+    dataset.GridFrameOffsetVector = (
+        frame_offsets if frame_offsets is not None else [0, 2][:pixels.shape[0]]
+    )
+    dataset.SamplesPerPixel = 1
+    dataset.PhotometricInterpretation = "MONOCHROME2"
+    dataset.BitsAllocated = 16
+    dataset.BitsStored = 16
+    dataset.HighBit = 15
+    dataset.PixelRepresentation = 0
+    dataset.PixelData = pixels.tobytes()
+    dataset.save_as(path, enforce_file_format=True)
+    return dataset
+
+
 class CACDicomTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -161,6 +198,399 @@ class CACDicomTests(unittest.TestCase):
         self.assertNotIn("RTSTRUCTs", dataframe.columns)
         self.assertEqual(result["Volume_score"], 48.0)
         self.assertEqual((invalid, outside), (0, 0))
+
+        dose = CAC.RTDoseVolume(
+            path=self.folder / "dose.dcm",
+            dose_gy=np.full((2, 4, 4), 2.5),
+            origin=np.array([0.0, 0.0, 0.0]),
+            row_direction=np.array([1.0, 0.0, 0.0]),
+            column_direction=np.array([0.0, 1.0, 0.0]),
+            normal=np.array([0.0, 0.0, 1.0]),
+            pixel_spacing=volume.pixel_spacing,
+            frame_offsets=np.array([0.0, 2.0]),
+            frame_uid=self.frame_uid,
+            summation_type="PLAN",
+        )
+        dose_dataframe, _, _ = CAC.calculate_results(
+            structures, volume, dose_grid=dose
+        )
+        self.assertAlmostEqual(dose_dataframe.iloc[0][CAC.DOSE_MEAN_COLUMN], 2.5)
+        self.assertTrue(np.isnan(dose_dataframe.iloc[0][CAC.DOSE_D0_5CC_COLUMN]))
+
+    def test_rt_dose_loads_cgy_as_gy_and_requires_matching_frame(self):
+        volume = self._create_volume()
+        dose_path = self.folder / "dose.dcm"
+        _write_rt_dose(
+            dose_path,
+            self.frame_uid,
+            np.full((2, 4, 4), 200),
+            units="CGY",
+            scaling=1.0,
+        )
+
+        dose = CAC.load_rt_dose(dose_path, volume)
+
+        self.assertEqual(dose.dose_gy.shape, (2, 4, 4))
+        self.assertEqual(dose.dose_gy[0, 0, 0], 2.0)
+        self.assertEqual(dose.summation_type, "PLAN")
+
+        absolute_path = self.folder / "absolute-offset-dose.dcm"
+        _write_rt_dose(
+            absolute_path,
+            self.frame_uid,
+            np.full((2, 4, 4), 200),
+            origin=(0, 0, 2),
+            frame_offsets=[2, 4],
+        )
+        absolute_dose = CAC.load_rt_dose(absolute_path, volume)
+        np.testing.assert_array_equal(absolute_dose.frame_offsets, [0, 2])
+
+        wrong_frame_path = self.folder / "wrong-frame-dose.dcm"
+        _write_rt_dose(
+            wrong_frame_path, generate_uid(), np.full((2, 4, 4), 200)
+        )
+        dose_with_different_frame = CAC.load_rt_dose(wrong_frame_path, volume)
+        self.assertTrue(dose_with_different_frame.frame_mismatch)
+        self.assertEqual(dose_with_different_frame.dose_gy[0, 0, 0], 200.0)
+
+    def test_rt_dose_reader_retries_without_file_meta_header(self):
+        volume = self._create_volume()
+        dose_path = self.folder / "dose-without-preamble.dcm"
+        dataset = _write_rt_dose(
+            dose_path,
+            self.frame_uid,
+            np.full((2, 4, 4), 200),
+        )
+        dataset.save_as(dose_path, write_like_original=True)
+        dose_path.write_bytes(dose_path.read_bytes()[132:])
+
+        with patch.object(CAC.pydicom, "dcmread", wraps=CAC.pydicom.dcmread) as reader:
+            dose = CAC.load_rt_dose(dose_path, volume)
+
+        self.assertEqual(dose.dose_gy.shape, (2, 4, 4))
+        self.assertEqual(reader.call_count, 2)
+        self.assertFalse(reader.call_args_list[0].kwargs.get("force", False))
+        self.assertTrue(reader.call_args_list[1].kwargs["force"])
+
+    def test_rt_dose_reader_infers_transfer_syntax_when_file_meta_is_missing(self):
+        volume = self._create_volume()
+        dose_path = self.folder / "dose-without-file-meta.dcm"
+        _write_rt_dose(
+            dose_path,
+            self.frame_uid,
+            np.full((2, 4, 4), 200),
+        )
+        file_bytes = dose_path.read_bytes()
+        file_meta_length = int.from_bytes(file_bytes[140:144], "little")
+        dataset_offset = 132 + 12 + file_meta_length
+        dose_path.write_bytes(file_bytes[dataset_offset:])
+
+        dose = CAC.load_rt_dose(dose_path, volume)
+
+        self.assertEqual(dose.dose_gy.shape, (2, 4, 4))
+        self.assertEqual(dose.dose_gy[0, 0, 0], 200.0)
+
+    def test_rt_dose_picker_loads_the_selected_file(self):
+        volume = self._create_volume()
+        dose_path = self.folder / "selected-dose.dcm"
+        _write_rt_dose(
+            dose_path, self.frame_uid, np.full((2, 4, 4), 20)
+        )
+
+        with patch.object(
+            CAC.filedialog,
+            "askopenfilename",
+            return_value=str(dose_path),
+        ) as picker:
+            dose = CAC._choose_rt_dose_file(object(), self.folder, volume)
+
+        self.assertEqual(dose.path, dose_path)
+        picker.assert_called_once()
+        self.assertEqual(picker.call_args.kwargs["initialdir"], str(self.folder))
+
+    def test_dose_metrics_use_weighted_mean_and_hottest_half_cc(self):
+        volume = self._create_volume()
+        volume.pixel_spacing = (10.0, 10.0)
+        volume.slice_spacings = np.array([10.0, 10.0])
+        dose_values = np.zeros((2, 4, 4), dtype=float)
+        dose_values[:, :, 0] = np.arange(1, 5)[None, :]
+        dose = CAC.RTDoseVolume(
+            path=self.folder / "dose.dcm",
+            dose_gy=dose_values,
+            origin=np.array([0.0, 0.0, 0.0]),
+            row_direction=np.array([1.0, 0.0, 0.0]),
+            column_direction=np.array([0.0, 1.0, 0.0]),
+            normal=np.array([0.0, 0.0, 1.0]),
+            pixel_spacing=(10.0, 10.0),
+            frame_offsets=np.array([0.0, 2.0]),
+            frame_uid=self.frame_uid,
+            summation_type="PLAN",
+        )
+        mask = np.zeros(volume.image.shape, dtype=bool)
+        mask[:, 0, 0] = True
+
+        mean_dose, d0_5cc = CAC._sample_rt_dose_on_mask(
+            mask, volume, dose, "test ROI"
+        )
+
+        self.assertEqual(mean_dose, 2.5)
+        self.assertEqual(d0_5cc, 4.0)
+
+        smaller_dose = CAC.RTDoseVolume(
+            **{
+                **dose.__dict__,
+                "dose_gy": dose_values[:, :2, :2],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "cobre 50.0%"):
+            CAC._sample_rt_dose_on_mask(mask, volume, smaller_dose, "test ROI")
+
+        volume.slice_spacings = np.array([3.0, 3.0])
+        weighted_values = np.zeros((2, 4, 4), dtype=float)
+        weighted_values[:, :, 0] = [10.0, 8.0, 0.0, 0.0]
+        weighted_dose = CAC.RTDoseVolume(
+            **{
+                **dose.__dict__,
+                "dose_gy": weighted_values,
+            }
+        )
+        fractional_cc_mask = np.zeros(volume.image.shape, dtype=bool)
+        fractional_cc_mask[:2, 0, 0] = True
+        mean_dose, d0_5cc = CAC._sample_rt_dose_on_mask(
+            fractional_cc_mask, volume, weighted_dose, "test ROI"
+        )
+        self.assertAlmostEqual(mean_dose, 9.0)
+        self.assertEqual(d0_5cc, 8.0)
+
+    def test_heart_constraints_compare_arm_ii_thresholds_by_laterality(self):
+        dataframe = pd.DataFrame([
+            {
+                "ROI": "Área cardíaca",
+                CAC.DOSE_V8_COLUMN: 32.0,
+                CAC.DOSE_V16_COLUMN: 4.0,
+                CAC.DOSE_V20_COLUMN: 6.0,
+            },
+            {"ROI": "mama_D", CAC.DOSE_MEAN_COLUMN: 20.0},
+            {"ROI": "mama_E", CAC.DOSE_MEAN_COLUMN: 40.0},
+        ])
+
+        constraints = CAC._heart_constraint_results(dataframe)
+        statuses = {
+            (row["Classificação"], row["Métrica"]): row
+            for row in constraints
+        }
+
+        self.assertEqual(len(constraints), 4)
+        self.assertEqual(CAC._treatment_laterality(dataframe), "Esquerda")
+        self.assertEqual(
+            statuses[("Ideal", "V16 Gy")]["Status"],
+            "PASSA",
+        )
+        self.assertEqual(
+            statuses[("Aceitável", "V20 Gy")]["Medido (%)"],
+            6.0,
+        )
+        self.assertEqual(
+            statuses[("Ideal", "V8 Gy")]["Status"],
+            "NÃO PASSA",
+        )
+        self.assertEqual(
+            statuses[("Aceitável", "V8 Gy")]["Status"],
+            "PASSA",
+        )
+
+    def test_dose_volume_percentages_are_volume_weighted(self):
+        volume = self._create_volume()
+        volume.pixel_spacing = (10.0, 10.0)
+        volume.slice_spacings = np.array([10.0, 10.0])
+        dose_values = np.zeros((2, 4, 4), dtype=float)
+        dose_values[0, 0, :2] = [16, 20]
+        dose_values[1, 0, :2] = [8, 7]
+        dose = CAC.RTDoseVolume(
+            path=self.folder / "dose.dcm",
+            dose_gy=dose_values,
+            origin=np.array([0.0, 0.0, 0.0]),
+            row_direction=np.array([1.0, 0.0, 0.0]),
+            column_direction=np.array([0.0, 1.0, 0.0]),
+            normal=np.array([0.0, 0.0, 1.0]),
+            pixel_spacing=(10.0, 10.0),
+            frame_offsets=np.array([0.0, 2.0]),
+            frame_uid=self.frame_uid,
+            summation_type="PLAN",
+        )
+        mask = np.zeros(volume.image.shape, dtype=bool)
+        mask[0, :2, :] = True
+
+        _mean, _d0_5cc, percentages = CAC._sample_rt_dose_metrics(
+            mask, volume, dose, "Área cardíaca"
+        )
+
+        self.assertEqual(percentages[16], 50.0)
+        self.assertEqual(percentages[8], 75.0)
+        self.assertEqual(percentages[20], 25.0)
+
+    def test_treatment_laterality_is_not_guessed_when_breast_doses_tie(self):
+        dataframe = pd.DataFrame([
+            {"ROI": "mama_D", CAC.DOSE_MEAN_COLUMN: 20.0},
+            {"ROI": "mama_E", CAC.DOSE_MEAN_COLUMN: 20.0},
+            {
+                "ROI": "Área cardíaca",
+                CAC.DOSE_V8_COLUMN: 10.0,
+                CAC.DOSE_V16_COLUMN: 0.0,
+                CAC.DOSE_V20_COLUMN: 0.0,
+            },
+        ])
+
+        self.assertIsNone(CAC._treatment_laterality(dataframe))
+        constraints = CAC._heart_constraint_results(dataframe)
+        self.assertTrue(all(row["Status"] == "NÃO AVALIADO" for row in constraints))
+        self.assertTrue(all(
+            row["Lateralidade"] == "Não identificada" for row in constraints
+        ))
+
+    def test_rtog_metrics_are_taken_only_from_area_cardiaca(self):
+        dataframe = pd.DataFrame([
+            {
+                "ROI": "heart",
+                CAC.DOSE_V8_COLUMN: 0.0,
+                CAC.DOSE_V16_COLUMN: 0.0,
+                CAC.DOSE_V20_COLUMN: 0.0,
+            },
+            {
+                "ROI": "Área cardíaca",
+                CAC.DOSE_V8_COLUMN: 32.0,
+                CAC.DOSE_V16_COLUMN: 4.0,
+                CAC.DOSE_V20_COLUMN: 6.0,
+            },
+            {"ROI": "mama_E", CAC.DOSE_MEAN_COLUMN: 40.0},
+        ])
+
+        constraints = CAC._heart_constraint_results(dataframe)
+
+        self.assertEqual(len(constraints), 4)
+        self.assertEqual(
+            {row["Métrica"]: row["Medido (%)"] for row in constraints},
+            {"V16 Gy": 4.0, "V20 Gy": 6.0, "V8 Gy": 32.0},
+        )
+
+    def test_open_pdf_opens_the_saved_file_in_default_viewer(self):
+        pdf_path = self.folder / "saved-report.pdf"
+        pdf_path.write_bytes(b"%PDF-")
+
+        with patch.object(CAC.webbrowser, "open", return_value=True) as open_browser:
+            CAC.open_pdf(pdf_path)
+
+        open_browser.assert_called_once_with(pdf_path.resolve().as_uri())
+
+    def test_dose_metrics_are_included_in_text_and_pdf_exports(self):
+        from types import SimpleNamespace
+
+        dataframe = pd.DataFrame([{
+            "ROI": "aorta",
+            CAC.AGATSTON_SCORE_COLUMN: 12.5,
+            "Volume_score": 24.0,
+            "Interpretação": "Risco leve",
+            "Cor": "yellow",
+            CAC.DOSE_MEAN_COLUMN: 3.25,
+            CAC.DOSE_D0_5CC_COLUMN: 7.5,
+            CAC.DOSE_V8_COLUMN: 20.0,
+            CAC.DOSE_V16_COLUMN: 4.0,
+            CAC.DOSE_V20_COLUMN: 6.0,
+        }, {
+            "ROI": "Área cardíaca",
+            CAC.AGATSTON_SCORE_COLUMN: 0.0,
+            "Volume_score": 0.0,
+            "Interpretação": "Nenhum risco detectável",
+            "Cor": "green",
+            CAC.DOSE_MEAN_COLUMN: 3.25,
+            CAC.DOSE_D0_5CC_COLUMN: 7.5,
+            CAC.DOSE_V8_COLUMN: 32.0,
+            CAC.DOSE_V16_COLUMN: 4.0,
+            CAC.DOSE_V20_COLUMN: 6.0,
+        }, {
+            "ROI": "mama_E",
+            CAC.AGATSTON_SCORE_COLUMN: 0.0,
+            "Volume_score": 0.0,
+            "Interpretação": "Nenhum risco detectável",
+            "Cor": "green",
+            CAC.DOSE_MEAN_COLUMN: 40.0,
+            CAC.DOSE_D0_5CC_COLUMN: 42.0,
+        }])
+        dose_grid = SimpleNamespace(
+            path=Path("dose.dcm"),
+            summation_type="PLAN",
+            frame_mismatch=False,
+        )
+        text = CAC.results_as_text(
+            dataframe, "Paciente Teste", "ID-123", dose_grid
+        )
+        self.assertIn("Dose média (Gy)", text)
+        self.assertIn("D0,5cc (Gy)", text)
+        self.assertIn("aorta\t12.5\t24.0\tRisco leve\t3.25\t7.50", text)
+        self.assertIn("RTDOSE\tdose.dcm", text)
+        self.assertIn("DoseSummationType\tPLAN", text)
+        self.assertIn("Constraints cardíacos", text)
+        self.assertIn("V16 Gy", text)
+        self.assertIn("V20 Gy", text)
+        self.assertIn("NÃO PASSA", text)
+        self.assertEqual(CAC._format_dose_value(np.nan), "N/A")
+
+        dose_grid.frame_mismatch = True
+        text = CAC.results_as_text(dataframe, "Paciente Teste", "ID-123", dose_grid)
+        self.assertIn("Frames of Reference diferentes", text)
+
+        output_path = self.folder / "dose-report.pdf"
+        CAC.save_report_pdf(
+            output_path,
+            dataframe,
+            "Paciente Teste",
+            "ID-123",
+            "30/06/2024",
+            "15/10/2026",
+            dose_grid=dose_grid,
+        )
+        pdf_bytes = output_path.read_bytes()
+        page_content = b" ".join(
+            zlib.decompress(
+                base64.a85decode(match.group(1).rstrip(b"\r\n"), adobe=True)
+            )
+            for match in re.finditer(
+                rb"stream\r?\n(.*?)endstream", pdf_bytes, re.DOTALL
+            )
+        )
+        self.assertIn(b"Dose m", page_content)
+        self.assertNotIn(b"M\\351tricas de dose", page_content)
+        self.assertIn(b"D0,5cc", page_content)
+        self.assertIn(b"7.50", page_content)
+        self.assertNotIn(b"dose.dcm", page_content)
+        self.assertIn(b"Constraints card", page_content)
+        self.assertNotIn(b"Heart dose constraint", page_content)
+        self.assertIn(b"Arm II", page_content)
+        self.assertIn(b"mama esquerda", page_content)
+        self.assertIn(b"PASSA", page_content)
+        self.assertIn(b"N\\303O PASSA", page_content)
+        dose_grid.frame_mismatch = True
+        mismatch_output_path = self.folder / "dose-report-mismatch.pdf"
+        CAC.save_report_pdf(
+            mismatch_output_path,
+            dataframe,
+            "Paciente Teste",
+            "ID-123",
+            "30/06/2024",
+            "15/10/2026",
+            dose_grid=dose_grid,
+        )
+        mismatch_bytes = mismatch_output_path.read_bytes()
+        mismatch_content = b" ".join(
+            zlib.decompress(
+                base64.a85decode(match.group(1).rstrip(b"\r\n"), adobe=True)
+            )
+            for match in re.finditer(
+                rb"stream\r?\n(.*?)endstream", mismatch_bytes, re.DOTALL
+            )
+        )
+        self.assertNotIn(b"Frames of Reference", mismatch_content)
+        self.assertNotIn(b"sem registro espacial", mismatch_content)
 
     def test_file_picker_accepts_multiple_rtstruct_files(self):
         volume = self._create_volume()
@@ -381,6 +811,29 @@ class CACDicomTests(unittest.TestCase):
         self.assertEqual(crop.size, (50, 100))
         self.assertIn((255, 40, 40), crop.getdata())
         self.assertNotIn((0, 255, 255), crop.getdata())
+        dose_values = np.broadcast_to(
+            np.arange(4, dtype=float)[None, None, :] * 5,
+            (2, 4, 4),
+        ).copy()
+        dose_grid = CAC.RTDoseVolume(
+            path=self.folder / "dose-overlay.dcm",
+            dose_gy=dose_values,
+            origin=np.array([0.0, 0.0, 0.0]),
+            row_direction=np.array([1.0, 0.0, 0.0]),
+            column_direction=np.array([0.0, 1.0, 0.0]),
+            normal=np.array([0.0, 0.0, 1.0]),
+            pixel_spacing=volume.pixel_spacing,
+            frame_offsets=np.array([0.0, 2.0]),
+            frame_uid=self.frame_uid,
+            summation_type="PLAN",
+        )
+        dose_image = Image.open(
+            CAC._render_calcification_crop(volume, finding, dose_grid=dose_grid)
+        )
+        self.assertTrue(any(
+            color in dose_image.getdata()
+            for color in ((0, 255, 255), (255, 220, 0), (255, 0, 255))
+        ))
         output_path = self.folder / "report-with-images.pdf"
 
         with patch.object(
@@ -397,6 +850,7 @@ class CACDicomTests(unittest.TestCase):
                 "15/10/2026",
                 volume=volume,
                 structures=structures,
+                dose_grid=dose_grid,
             )
 
         pdf_bytes = output_path.read_bytes()
@@ -414,6 +868,7 @@ class CACDicomTests(unittest.TestCase):
         self.assertIn(b"coronary", page_content)
         self.assertIn(b"aorta", page_content)
         self.assertIn(b"recorte de 10", page_content)
+        self.assertEqual(page_content.count(b"Isodoses"), 2)
         self.assertEqual(page_content.count(b"Calcifica"), 2)
         self.assertEqual(page_content.count(b"Grupo 1"), 2)
         self.assertEqual(page_content.count(b"Grupo 2"), 2)

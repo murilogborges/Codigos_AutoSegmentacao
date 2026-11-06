@@ -4,21 +4,38 @@ import csv
 from datetime import datetime
 from io import BytesIO, StringIO
 from pathlib import Path
+import struct
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import unicodedata
+import webbrowser
 
 import numpy as np
 import pandas as pd
 import pydicom
-from pydicom.dataset import Dataset
+from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.errors import InvalidDicomError
-from pydicom.uid import CTImageStorage, RTStructureSetStorage
-from skimage import draw
+from pydicom.filereader import read_dataset
+from pydicom.uid import (
+    CTImageStorage,
+    ExplicitVRBigEndian,
+    ExplicitVRLittleEndian,
+    ImplicitVRLittleEndian,
+    RTDoseStorage,
+    RTStructureSetStorage,
+)
+from skimage import draw, measure
 
 
 CT_IMAGE_UID = str(CTImageStorage)
 RTSTRUCT_UID = str(RTStructureSetStorage)
+RTDOSE_UID = str(RTDoseStorage)
 AGATSTON_SCORE_COLUMN = "Agatston_score"
+DOSE_MEAN_COLUMN = "Dose_mean_Gy"
+DOSE_D0_5CC_COLUMN = "Dose_D0.5cc_Gy"
+DOSE_V8_COLUMN = "Dose_V8Gy_percent"
+DOSE_V16_COLUMN = "Dose_V16Gy_percent"
+DOSE_V20_COLUMN = "Dose_V20Gy_percent"
 ARTICLE_REFERENCE_ABNT = (
     "BELARDO, Alfonso et al. Density and volume of cardiac calcifications detected "
     "on planning CT predicts cardiotoxicity after hypo-fractionated whole breast "
@@ -45,6 +62,13 @@ ROI_TRANSLATIONS = {
 LEGACY_AGATSTON_SCORE_COLUMN = "Agatson_score"
 READ_ERRORS = (InvalidDicomError, OSError, EOFError, ValueError)
 PIXEL_ERRORS = (AttributeError, OSError, RuntimeError, ValueError, NotImplementedError)
+_VALID_VRS = {
+    b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FD", b"FL", b"IS",
+    b"LO", b"LT", b"OB", b"OD", b"OF", b"OL", b"OV", b"OW", b"PN", b"SH",
+    b"SL", b"SQ", b"SS", b"ST", b"SV", b"TM", b"UC", b"UI", b"UL", b"UN",
+    b"UR", b"US", b"UT", b"UV",
+}
+_LONG_VRS = {b"OB", b"OD", b"OF", b"OL", b"OV", b"SQ", b"UC", b"UR", b"UT", b"UN"}
 
 
 @dataclass
@@ -61,6 +85,21 @@ class CTVolume:
     normal: np.ndarray
     origins: np.ndarray
     slice_positions: np.ndarray
+
+
+@dataclass
+class RTDoseVolume:
+    path: Path
+    dose_gy: np.ndarray
+    origin: np.ndarray
+    row_direction: np.ndarray
+    column_direction: np.ndarray
+    normal: np.ndarray
+    pixel_spacing: tuple[float, float]
+    frame_offsets: np.ndarray
+    frame_uid: str
+    summation_type: str
+    frame_mismatch: bool = False
 
 
 def interpretar_agatson(score):
@@ -372,6 +411,395 @@ def scan_rtstructs(folder, volume):
     return scan_rtstruct_paths(Path(folder).iterdir(), volume)
 
 
+def _read_dicom_without_transfer_syntax(path):
+    with path.open("rb") as stream:
+        initial = stream.read(132)
+        offset = 132 if len(initial) >= 132 and initial[128:132] == b"DICM" else 0
+        stream.seek(offset)
+        while True:
+            element_start = stream.tell()
+            header = stream.read(8)
+            if len(header) < 8:
+                raise ValueError(f"{path} não contém um cabeçalho DICOM válido.")
+            group = struct.unpack("<H", header[:2])[0]
+            if group != 0x0002:
+                stream.seek(element_start)
+                break
+            vr = header[4:6]
+            if vr not in _VALID_VRS:
+                raise ValueError(f"{path} possui metadados DICOM inválidos.")
+            if vr in _LONG_VRS:
+                length_data = stream.read(4)
+                if len(length_data) != 4:
+                    raise ValueError(f"{path} possui metadados DICOM truncados.")
+                length = struct.unpack("<I", length_data)[0]
+            else:
+                length = struct.unpack("<H", header[6:8])[0]
+            if length == 0xFFFFFFFF:
+                raise ValueError(f"{path} possui um elemento de metadados com tamanho indefinido.")
+            stream.seek(length, 1)
+
+        dataset_offset = stream.tell()
+        header = stream.read(8)
+        if len(header) < 8:
+            raise ValueError(f"{path} não contém elementos de dataset DICOM.")
+
+        little_group = struct.unpack("<H", header[:2])[0]
+        big_group = struct.unpack(">H", header[:2])[0]
+        common_groups = {0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x3004, 0x7FE0}
+        if little_group in common_groups:
+            is_little_endian = True
+        elif big_group in common_groups:
+            is_little_endian = False
+        else:
+            is_little_endian = True
+        is_explicit_vr = header[4:6] in _VALID_VRS
+        if is_explicit_vr and not is_little_endian:
+            transfer_syntax = ExplicitVRBigEndian
+        elif is_explicit_vr:
+            transfer_syntax = ExplicitVRLittleEndian
+        else:
+            transfer_syntax = ImplicitVRLittleEndian
+
+        stream.seek(dataset_offset)
+        dataset = read_dataset(
+            stream,
+            is_implicit_VR=transfer_syntax == ImplicitVRLittleEndian,
+            is_little_endian=transfer_syntax != ExplicitVRBigEndian,
+        )
+    dataset.file_meta = FileMetaDataset()
+    dataset.file_meta.TransferSyntaxUID = transfer_syntax
+    return dataset
+
+
+def _read_rt_dose_dataset(path):
+    try:
+        dataset = pydicom.dcmread(path)
+    except InvalidDicomError:
+        dataset = pydicom.dcmread(path, force=True)
+    file_meta = getattr(dataset, "file_meta", None)
+    if not getattr(file_meta, "TransferSyntaxUID", None):
+        dataset = _read_dicom_without_transfer_syntax(path)
+    return dataset
+
+
+def load_rt_dose(path, volume):
+    path = Path(path)
+    dataset = _read_rt_dose_dataset(path)
+    if _sop_class_uid(dataset) != RTDOSE_UID and str(
+        getattr(dataset, "Modality", "")
+    ).upper() != "RTDOSE":
+        raise ValueError(f"O arquivo selecionado não é um RTDOSE DICOM: {path}")
+
+    frame_uid = str(getattr(dataset, "FrameOfReferenceUID", ""))
+    if not frame_uid or not volume.frame_uid:
+        raise ValueError("O RTDOSE e a série CT precisam informar o Frame of Reference.")
+    frame_mismatch = frame_uid != volume.frame_uid
+
+    units = str(getattr(dataset, "DoseUnits", "")).upper()
+    if units not in {"GY", "CGY"}:
+        raise ValueError(
+            f"A unidade de dose '{units or 'ausente'}' não é absoluta (GY/CGY)."
+        )
+    dose_type = str(getattr(dataset, "DoseType", "")).upper()
+    if dose_type and dose_type != "PHYSICAL":
+        raise ValueError(
+            f"O RTDOSE contém DoseType '{dose_type}', não dose física."
+        )
+
+    pixels = np.asarray(dataset.pixel_array, dtype=np.float64)
+    if pixels.ndim == 2:
+        pixels = pixels[np.newaxis, ...]
+    if pixels.ndim != 3:
+        raise ValueError("O RTDOSE precisa conter uma grade 3D de dose.")
+    try:
+        scale = float(getattr(dataset, "DoseGridScaling", 0))
+    except (TypeError, ValueError) as error:
+        raise ValueError("O RTDOSE não possui DoseGridScaling válido.") from error
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("O RTDOSE não possui DoseGridScaling válido.")
+    dose_gy = pixels * scale * (0.01 if units == "CGY" else 1.0)
+    if not np.isfinite(dose_gy).all():
+        raise ValueError("A grade RTDOSE contém valores de dose inválidos.")
+
+    orientation = _vector(dataset, "ImageOrientationPatient", 6)
+    row_direction = orientation[:3]
+    column_direction = orientation[3:]
+    if (not np.isclose(np.linalg.norm(row_direction), 1, atol=1e-4)
+            or not np.isclose(np.linalg.norm(column_direction), 1, atol=1e-4)
+            or not np.isclose(np.dot(row_direction, column_direction), 0, atol=1e-4)):
+        raise ValueError("ImageOrientationPatient inválido no RTDOSE.")
+    normal = np.cross(row_direction, column_direction)
+    normal /= np.linalg.norm(normal)
+    origin = _vector(dataset, "ImagePositionPatient", 3)
+    pixel_spacing = _vector(dataset, "PixelSpacing", 2)
+    if np.any(pixel_spacing <= 0):
+        raise ValueError("PixelSpacing deve conter valores positivos no RTDOSE.")
+    try:
+        offsets = np.asarray(
+            getattr(dataset, "GridFrameOffsetVector", [0.0]), dtype=float
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("GridFrameOffsetVector do RTDOSE é inválido.") from error
+    if offsets.shape != (dose_gy.shape[0],) or not np.isfinite(offsets).all():
+        raise ValueError("GridFrameOffsetVector não corresponde às dimensões do RTDOSE.")
+    if (
+        np.allclose(row_direction, [1, 0, 0], atol=1e-5)
+        and np.allclose(column_direction, [0, 1, 0], atol=1e-5)
+        and np.isclose(offsets[0], origin[2], atol=1e-5)
+    ):
+        offsets = offsets - float(np.dot(origin, normal))
+    order = np.argsort(offsets)
+    offsets = offsets[order]
+    dose_gy = dose_gy[order, :, :]
+    if len(offsets) > 1 and np.any(np.diff(offsets) <= 0):
+        raise ValueError("O RTDOSE possui posições de quadros inválidas.")
+
+    return RTDoseVolume(
+        path=path,
+        dose_gy=dose_gy,
+        origin=origin,
+        row_direction=row_direction,
+        column_direction=column_direction,
+        normal=normal,
+        pixel_spacing=(float(pixel_spacing[0]), float(pixel_spacing[1])),
+        frame_offsets=offsets,
+        frame_uid=frame_uid,
+        summation_type=str(getattr(dataset, "DoseSummationType", "Não informado")),
+        frame_mismatch=frame_mismatch,
+    )
+
+
+def _sample_rt_dose_on_mask(mask, volume, dose_grid, roi_name):
+    mean_dose, d0_5cc, _ = _sample_rt_dose_metrics(
+        mask, volume, dose_grid, roi_name
+    )
+    return mean_dose, d0_5cc
+
+
+def _sample_dose_at_patient_points(points, dose_grid):
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    relative = points - dose_grid.origin
+    dose_columns = relative @ dose_grid.row_direction / dose_grid.pixel_spacing[1]
+    dose_rows = relative @ dose_grid.column_direction / dose_grid.pixel_spacing[0]
+    frame_positions = relative @ dose_grid.normal
+
+    frame_count, dose_row_count, dose_column_count = dose_grid.dose_gy.shape
+    tolerance = 1e-5
+    valid = (
+        (dose_columns >= -tolerance)
+        & (dose_columns <= dose_column_count - 1 + tolerance)
+        & (dose_rows >= -tolerance)
+        & (dose_rows <= dose_row_count - 1 + tolerance)
+    )
+    offsets = dose_grid.frame_offsets
+    if frame_count == 1:
+        valid &= np.isclose(frame_positions, offsets[0], atol=tolerance)
+        frame_coordinates = np.zeros(len(points), dtype=float)
+    else:
+        valid &= (
+            (frame_positions >= offsets[0] - tolerance)
+            & (frame_positions <= offsets[-1] + tolerance)
+        )
+        frame_coordinates = np.interp(
+            frame_positions, offsets, np.arange(frame_count, dtype=float)
+        )
+
+    samples = np.full(len(points), np.nan, dtype=float)
+    if not np.any(valid):
+        return samples, valid
+
+    dose_columns = np.clip(dose_columns, 0, dose_column_count - 1)
+    dose_rows = np.clip(dose_rows, 0, dose_row_count - 1)
+    frame_coordinates = np.clip(frame_coordinates, 0, frame_count - 1)
+    lower_columns = np.floor(dose_columns).astype(int)
+    lower_rows = np.floor(dose_rows).astype(int)
+    lower_frames = np.floor(frame_coordinates).astype(int)
+    upper_columns = np.minimum(lower_columns + 1, dose_column_count - 1)
+    upper_rows = np.minimum(lower_rows + 1, dose_row_count - 1)
+    upper_frames = np.minimum(lower_frames + 1, frame_count - 1)
+    column_fraction = dose_columns - lower_columns
+    row_fraction = dose_rows - lower_rows
+    frame_fraction = frame_coordinates - lower_frames
+
+    interpolated = np.zeros(len(points), dtype=float)
+    for frame_index, frame_weight in (
+        (lower_frames, 1 - frame_fraction),
+        (upper_frames, frame_fraction),
+    ):
+        for row_index, row_weight in (
+            (lower_rows, 1 - row_fraction),
+            (upper_rows, row_fraction),
+        ):
+            for column_index, column_weight in (
+                (lower_columns, 1 - column_fraction),
+                (upper_columns, column_fraction),
+            ):
+                interpolated += (
+                    dose_grid.dose_gy[frame_index, row_index, column_index]
+                    * frame_weight
+                    * row_weight
+                    * column_weight
+                )
+    samples[valid] = interpolated[valid]
+    return samples, valid
+
+
+def _sample_rt_dose_metrics(mask, volume, dose_grid, roi_name):
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != volume.image.shape:
+        raise ValueError("A máscara da estrutura não coincide com a grade CT.")
+    rows, columns, slices = np.nonzero(mask)
+    if not len(rows):
+        return np.nan, np.nan, {8: np.nan, 16: np.nan, 20: np.nan}
+
+    ct_points = (
+        volume.origins[slices]
+        + (columns * volume.pixel_spacing[1])[:, None] * volume.row_direction
+        + (rows * volume.pixel_spacing[0])[:, None] * volume.column_direction
+    )
+    samples, valid = _sample_dose_at_patient_points(ct_points, dose_grid)
+    coverage = float(np.count_nonzero(valid)) / len(rows)
+    if not np.all(valid):
+        raise ValueError(
+            f"O RTDOSE cobre {coverage:.1%} dos voxels da estrutura "
+            f"'{roi_name}'; é necessária cobertura integral para calcular "
+            "a dose média e D0,5cc."
+        )
+
+    voxel_volumes_cc = (
+        volume.pixel_spacing[0]
+        * volume.pixel_spacing[1]
+        * volume.slice_spacings[slices]
+        / 1000.0
+    )
+    total_volume_cc = float(np.sum(voxel_volumes_cc))
+    mean_dose = float(np.average(samples, weights=voxel_volumes_cc))
+    if total_volume_cc < 0.5:
+        d0_5cc = np.nan
+    else:
+        hottest_order = np.argsort(samples)[::-1]
+        hottest_doses = samples[hottest_order]
+        cumulative_volume = np.cumsum(voxel_volumes_cc[hottest_order])
+        threshold_index = min(
+            int(np.searchsorted(cumulative_volume, 0.5, side="left")),
+            len(hottest_doses) - 1,
+        )
+        d0_5cc = float(hottest_doses[threshold_index])
+    volume_percentages = {
+        threshold: float(
+            np.sum(voxel_volumes_cc[samples >= threshold]) / total_volume_cc * 100
+        )
+        for threshold in (8, 16, 20)
+    }
+    return mean_dose, d0_5cc, volume_percentages
+
+
+def _normalize_roi_name(name):
+    normalized = unicodedata.normalize("NFKD", str(name).casefold())
+    return "".join(character for character in normalized if not unicodedata.combining(character))
+
+
+def _breast_laterality(name):
+    normalized = _normalize_roi_name(name)
+    if "mama" not in normalized and "breast" not in normalized:
+        return None
+    tokens = normalized.replace("-", "_").replace(" ", "_").split("_")
+    if any(token in {"e", "esq", "esquerda", "esquerdo", "left", "l"} for token in tokens):
+        return "Esquerda"
+    if any(token in {"d", "dir", "direita", "direito", "right", "r"} for token in tokens):
+        return "Direita"
+    return None
+
+
+def _treatment_laterality(dataframe):
+    if DOSE_MEAN_COLUMN not in dataframe:
+        return None
+    candidates = []
+    for _, row in dataframe.iterrows():
+        side = _breast_laterality(row["ROI"])
+        dose = pd.to_numeric(row[DOSE_MEAN_COLUMN], errors="coerce")
+        if side and pd.notna(dose) and np.isfinite(dose):
+            candidates.append((float(dose), side))
+    if not candidates:
+        return None
+    highest_dose = max(dose for dose, _ in candidates)
+    sides = {
+        side for dose, side in candidates
+        if np.isclose(dose, highest_dose, rtol=0, atol=1e-6)
+    }
+    return next(iter(sides)) if len(sides) == 1 else None
+
+
+def _heart_constraint_results(dataframe):
+    cardiac_rows = dataframe[
+        dataframe["ROI"].map(
+            lambda name: _normalize_roi_name(name) == "area cardiaca"
+        )
+    ]
+    cardiac_row = cardiac_rows.iloc[0] if not cardiac_rows.empty else None
+    laterality = _treatment_laterality(dataframe)
+    rows = []
+    constraint_specs = (
+        (1, "Ideal", 16, {"Esquerda": 5.0, "Direita": 0.0}),
+        (1, "Aceitável", 20, {"Esquerda": 5.0, "Direita": 0.0}),
+        (2, "Ideal", 8, {"Esquerda": 30.0, "Direita": 10.0}),
+        (2, "Aceitável", 8, {"Esquerda": 35.0, "Direita": 15.0}),
+    )
+    dose_columns = {
+        8: DOSE_V8_COLUMN,
+        16: DOSE_V16_COLUMN,
+        20: DOSE_V20_COLUMN,
+    }
+    for constraint, classification, dose_threshold, limits in constraint_specs:
+        column = dose_columns[dose_threshold]
+        limit = limits.get(laterality, np.nan)
+        measured = (
+            float(cardiac_row[column])
+            if cardiac_row is not None
+            and column in cardiac_row.index
+            and pd.notna(cardiac_row[column])
+            else np.nan
+        )
+        if np.isnan(measured) or np.isnan(limit):
+            status = "NÃO AVALIADO"
+        else:
+            status = "PASSA" if measured <= limit else "NÃO PASSA"
+        rows.append({
+            "Constraint": f"Heart dose constraint {constraint}",
+            "Classificação": classification,
+            "Lateralidade": laterality or "Não identificada",
+            "Métrica": f"V{dose_threshold} Gy",
+            "Limite (%)": limit,
+            "Medido (%)": measured,
+            "Status": status,
+        })
+    return rows
+
+
+def _choose_rt_dose_file(root, initial_folder, volume):
+    while True:
+        selected_path = filedialog.askopenfilename(
+            parent=root,
+            title="Selecione o arquivo DICOM RTDOSE",
+            initialdir=str(initial_folder),
+            filetypes=[
+                ("Arquivos DICOM", "*.dcm"),
+                ("Todos os arquivos", "*.*"),
+            ],
+        )
+        if not selected_path:
+            return None
+        try:
+            return load_rt_dose(selected_path, volume)
+        except (*READ_ERRORS, *PIXEL_ERRORS) as error:
+            messagebox.showerror(
+                "Erro ao ler o RTDOSE",
+                str(error),
+                parent=root,
+            )
+
+
 def _center_window(window, width, height):
     window.update_idletasks()
     screen_width = window.winfo_screenwidth()
@@ -581,7 +1009,7 @@ def agatson_score(filtered_array, cluster, volume, slice_index):
     return round(weighted_score, 1), round(volume_score, 1)
 
 
-def calculate_results(structures, volume):
+def calculate_results(structures, volume, dose_grid=None):
     results = []
     invalid_contours = 0
     outside_contours = 0
@@ -589,6 +1017,10 @@ def calculate_results(structures, volume):
         mask, invalid, outside = get_mask_from_contours(contours, volume)
         invalid_contours += invalid
         outside_contours += outside
+        if dose_grid is not None:
+            mean_dose, d0_5cc, dose_volume_percentages = _sample_rt_dose_metrics(
+                mask, volume, dose_grid, roi_name
+            )
         total_score = 0
         total_volume = 0
         for slice_index in range(volume.image.shape[2]):
@@ -601,14 +1033,29 @@ def calculate_results(structures, volume):
                 total_score += score
                 total_volume += cluster_volume
         risk, color = interpretar_agatson(total_score)
-        results.append({
+        result = {
             "ROI": roi_name,
             AGATSTON_SCORE_COLUMN: round(total_score, 1),
             "Volume_score": round(total_volume, 1),
             "Interpretação": risk,
             "Cor": color,
-        })
+        }
+        if dose_grid is not None:
+            result[DOSE_MEAN_COLUMN] = mean_dose
+            result[DOSE_D0_5CC_COLUMN] = d0_5cc
+            result[DOSE_V8_COLUMN] = dose_volume_percentages[8]
+            result[DOSE_V16_COLUMN] = dose_volume_percentages[16]
+            result[DOSE_V20_COLUMN] = dose_volume_percentages[20]
+        results.append(result)
     columns = ["ROI", AGATSTON_SCORE_COLUMN, "Volume_score", "Interpretação", "Cor"]
+    if dose_grid is not None:
+        columns.extend([
+            DOSE_MEAN_COLUMN,
+            DOSE_D0_5CC_COLUMN,
+            DOSE_V8_COLUMN,
+            DOSE_V16_COLUMN,
+            DOSE_V20_COLUMN,
+        ])
     dataframe = pd.DataFrame(results, columns=columns)
     if not dataframe.empty:
         dataframe = dataframe.sort_values(by=AGATSTON_SCORE_COLUMN, ascending=False)
@@ -737,9 +1184,32 @@ def _mask_boundary(mask):
     return inner & ~interior
 
 
-def _render_calcification_crop(volume, finding, size_mm=100):
+def _rt_dose_isodose_levels(dose_grid):
+    maximum_dose = float(np.max(dose_grid.dose_gy))
+    if maximum_dose < 1:
+        return []
+    return np.arange(1.0, maximum_dose + 1e-9, 5.0).tolist()
+
+
+def _isodose_color(index):
+    palette = (
+        (0, 255, 255),
+        (255, 220, 0),
+        (255, 0, 255),
+        (0, 220, 80),
+        (255, 100, 0),
+        (80, 140, 255),
+        (255, 60, 60),
+        (190, 255, 0),
+        (255, 255, 255),
+        (150, 80, 255),
+    )
+    return palette[index % len(palette)]
+
+
+def _render_calcification_crop(volume, finding, size_mm=100, dose_grid=None):
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw
     except ModuleNotFoundError as error:
         raise RuntimeError(
             "A biblioteca Pillow é necessária para incluir imagens no relatório PDF."
@@ -759,6 +1229,7 @@ def _render_calcification_crop(volume, finding, size_mm=100):
     image_slice = volume.image[:, :, finding["slice_index"]]
     hu_crop = np.full((crop_rows, crop_columns), -1000.0, dtype=np.float32)
     structure_crop = np.zeros((crop_rows, crop_columns), dtype=bool)
+    dose_crop = np.full((crop_rows, crop_columns), np.nan, dtype=np.float32)
     source_row_start = max(0, row_start)
     source_column_start = max(0, column_start)
     source_row_end = min(image_slice.shape[0], row_end)
@@ -778,6 +1249,23 @@ def _render_calcification_crop(volume, finding, size_mm=100):
         )
         hu_crop[target_rows, target_columns] = image_slice[source]
         structure_crop[target_rows, target_columns] = finding["structure_mask"][source]
+        if dose_grid is not None:
+            row_grid, column_grid = np.meshgrid(
+                np.arange(source_row_start, source_row_end),
+                np.arange(source_column_start, source_column_end),
+                indexing="ij",
+            )
+            patient_points = (
+                volume.origins[finding["slice_index"]]
+                + (column_grid.ravel() * volume.pixel_spacing[1])[:, None]
+                * volume.row_direction
+                + (row_grid.ravel() * volume.pixel_spacing[0])[:, None]
+                * volume.column_direction
+            )
+            dose_values, _ = _sample_dose_at_patient_points(patient_points, dose_grid)
+            dose_crop[target_rows, target_columns] = dose_values.reshape(
+                row_grid.shape
+            )
 
     window_low, window_high = -100.0, 300.0
     grayscale = np.clip(
@@ -787,25 +1275,106 @@ def _render_calcification_crop(volume, finding, size_mm=100):
     ).astype(np.uint8)
     rgb = np.repeat(grayscale[:, :, np.newaxis], 3, axis=2)
     rgb[_mask_boundary(structure_crop)] = (255, 40, 40)
+    image = Image.fromarray(rgb, mode="RGB")
+    if dose_grid is not None and np.isfinite(dose_crop).any():
+        image_draw = ImageDraw.Draw(image)
+        for index, level in enumerate(_rt_dose_isodose_levels(dose_grid)):
+            for contour in measure.find_contours(
+                dose_crop,
+                level,
+                mask=np.isfinite(dose_crop),
+            ):
+                if len(contour) < 2:
+                    continue
+                image_draw.line(
+                    [(float(column), float(row)) for row, column in contour],
+                    fill=_isodose_color(index),
+                    width=2,
+                )
 
     output = BytesIO()
-    Image.fromarray(rgb, mode="RGB").save(output, format="PNG")
+    image.save(output, format="PNG")
     output.seek(0)
     return output
 
 
-def results_as_text(dataframe, patient_name, patient_id):
+def results_as_text(dataframe, patient_name, patient_id, dose_grid=None):
     dataframe = normalize_results_dataframe(dataframe)
     output = StringIO()
     writer = csv.writer(output, delimiter="\t", lineterminator="\n")
     writer.writerow(["Paciente", patient_name])
     writer.writerow(["ID", patient_id])
+    if dose_grid is not None:
+        writer.writerow(["RTDOSE", dose_grid.path.name])
+        writer.writerow(["DoseSummationType", dose_grid.summation_type])
+        if dose_grid.frame_mismatch:
+            writer.writerow([
+                "Aviso",
+                "Frames of Reference diferentes; coordenadas físicas assumidas "
+                "comparáveis, sem registro espacial.",
+            ])
     writer.writerow([])
     columns = ["ROI", AGATSTON_SCORE_COLUMN, "Volume_score", "Interpretação"]
-    writer.writerow(["Estrutura", "Agatston Score", "Volume (mm³)", "Interpretação"])
+    headers = ["Estrutura", "Agatston Score", "Volume (mm³)", "Interpretação"]
+    if DOSE_MEAN_COLUMN in dataframe and DOSE_D0_5CC_COLUMN in dataframe:
+        columns.extend([DOSE_MEAN_COLUMN, DOSE_D0_5CC_COLUMN])
+        headers.extend(["Dose média (Gy)", "D0,5cc (Gy)"])
+    writer.writerow(headers)
     for _, row in dataframe.iterrows():
-        writer.writerow([row[column] for column in columns])
+        values = [row[column] for column in columns]
+        if DOSE_MEAN_COLUMN in dataframe and DOSE_D0_5CC_COLUMN in dataframe:
+            values[-2:] = [
+                _format_dose_value(row[DOSE_MEAN_COLUMN]),
+                _format_dose_value(row[DOSE_D0_5CC_COLUMN]),
+            ]
+        writer.writerow(values)
+    if all(column in dataframe for column in (
+        DOSE_V8_COLUMN, DOSE_V16_COLUMN, DOSE_V20_COLUMN
+    )):
+        writer.writerow([])
+        writer.writerow(["Constraints cardíacos — RTOG 1005"])
+        writer.writerow([
+            "Limites de dose utilizados",
+            "Arm II: V16 Gy ideal / V20 Gy aceitável no constraint 1; V8 Gy no constraint 2",
+        ])
+        writer.writerow([
+            "Classificação",
+            "Lateralidade",
+            "Métrica",
+            "Limite",
+            "Medido",
+            "Status",
+        ])
+        for constraint in _heart_constraint_results(dataframe):
+            writer.writerow([
+                constraint["Classificação"],
+                constraint["Lateralidade"],
+                constraint["Métrica"],
+                _format_percent_value(constraint["Limite (%)"]),
+                _format_percent_value(constraint["Medido (%)"]),
+                constraint["Status"],
+            ])
     return output.getvalue()
+
+
+def _format_dose_value(value):
+    if pd.isna(value):
+        return "N/A"
+    return f"{float(value):.2f}"
+
+
+def _format_percent_value(value):
+    if pd.isna(value):
+        return "N/A"
+    return f"{float(value):.2f}%"
+
+
+def open_pdf(path):
+    pdf_path = Path(path).resolve()
+    if not pdf_path.is_file():
+        raise FileNotFoundError(f"O PDF não foi encontrado: {pdf_path}")
+    if not webbrowser.open(pdf_path.as_uri()):
+        raise RuntimeError(f"Não foi possível abrir o PDF: {pdf_path}")
 
 
 def save_report_pdf(
@@ -817,6 +1386,7 @@ def save_report_pdf(
     analysis_date,
     volume=None,
     structures=None,
+    dose_grid=None,
 ):
     dataframe = normalize_results_dataframe(dataframe)
     if (volume is None) != (structures is None):
@@ -829,7 +1399,9 @@ def save_report_pdf(
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
+        from reportlab.pdfgen import canvas as pdf_canvas
         from reportlab.platypus import (
+            Flowable,
             Image as ReportImage,
             LongTable,
             PageBreak,
@@ -848,6 +1420,11 @@ def save_report_pdf(
         raise
 
     page_size = A4
+    report_title = (
+        "Relatório de Agatston e dose de radioterapia"
+        if dose_grid is not None
+        else "Resultado da análise de escore de Agatston"
+    )
     document = SimpleDocTemplate(
         str(path),
         pagesize=page_size,
@@ -855,7 +1432,7 @@ def save_report_pdf(
         leftMargin=11 * mm,
         topMargin=12 * mm,
         bottomMargin=23 * mm,
-        title="Resultado da análise de escore de Agatston",
+        title=report_title,
         author="CAC",
     )
     base_styles = getSampleStyleSheet()
@@ -894,7 +1471,7 @@ def save_report_pdf(
         fontName="Helvetica-Bold",
     )
     story = [
-        Paragraph("Resultado da análise de escore de Agatston", title_style),
+        Paragraph(escape(report_title), title_style),
         Paragraph(f"<b>Paciente:</b> {escape(patient_name)}", body_style),
         Paragraph(f"<b>ID:</b> {escape(patient_id)}", body_style),
         Paragraph(f"<b>Data da tomografia:</b> {escape(tomography_date)}", body_style),
@@ -902,8 +1479,12 @@ def save_report_pdf(
         Spacer(1, 4 * mm),
         Paragraph("Resultados", section_style),
     ]
-
     headers = ["Estrutura", "Agatston Score", "Volume (mm³)", "Interpretação"]
+    has_dose_metrics = (
+        DOSE_MEAN_COLUMN in dataframe and DOSE_D0_5CC_COLUMN in dataframe
+    )
+    if has_dose_metrics:
+        headers.extend(["Dose média (Gy)", "D0,5cc (Gy)"])
     table_data = [[Paragraph(escape(value), header_style) for value in headers]]
     risk_colors = {
         "green": colors.HexColor("#d9ead3"),
@@ -913,16 +1494,26 @@ def save_report_pdf(
     }
     for _, row in dataframe.iterrows():
         interpretation = str(row["Interpretação"]).split(" ", 1)[-1]
-        table_data.append([
+        table_row = [
             Paragraph(escape(str(row["ROI"])), cell_style),
             Paragraph(escape(str(row[AGATSTON_SCORE_COLUMN])), cell_style),
             Paragraph(escape(str(row["Volume_score"])), cell_style),
             Paragraph(escape(interpretation), cell_style),
-        ])
+        ]
+        if has_dose_metrics:
+            table_row.extend([
+                Paragraph(escape(_format_dose_value(row[DOSE_MEAN_COLUMN])), cell_style),
+                Paragraph(escape(_format_dose_value(row[DOSE_D0_5CC_COLUMN])), cell_style),
+            ])
+        table_data.append(table_row)
 
+    if has_dose_metrics:
+        result_widths = [35 * mm, 27 * mm, 25 * mm, 33 * mm, 32 * mm, 29 * mm]
+    else:
+        result_widths = [46 * mm, 37 * mm, 37 * mm, 62 * mm]
     table = LongTable(
         table_data,
-        colWidths=[46 * mm, 37 * mm, 37 * mm, 62 * mm],
+        colWidths=result_widths,
         repeatRows=1,
         hAlign="LEFT",
     )
@@ -941,6 +1532,108 @@ def save_report_pdf(
             table_styles.append(("BACKGROUND", (0, index), (-1, index), color))
     table.setStyle(TableStyle(table_styles))
     story.append(table)
+    if has_dose_metrics:
+        story.extend([
+            Spacer(1, 2 * mm),
+            Paragraph(
+                "A dose média é ponderada pelo volume dos voxels da estrutura. "
+                "D0,5cc corresponde à dose do volume mais quente de 0,5 cm³; "
+                "as doses são interpoladas nos centros dos voxels da CT. "
+                "Estruturas menores que 0,5 cm³ não têm D0,5cc calculável.",
+                body_style,
+            ),
+        ])
+    if all(column in dataframe for column in (
+        DOSE_V8_COLUMN, DOSE_V16_COLUMN, DOSE_V20_COLUMN
+    )):
+        treatment_side = _treatment_laterality(dataframe)
+        side_note = (
+            f"Lateralidade inferida pela estrutura mamária com maior dose média: "
+            f"mama {treatment_side.lower()}."
+            if treatment_side
+            else "Lateralidade não identificada por ausência de estrutura mamária "
+                 "lateralizada ou empate na maior dose média; constraints não avaliados."
+        )
+        story.extend([
+            PageBreak(),
+            Paragraph("Constraints cardíacos — RTOG 1005", section_style),
+            Paragraph(
+                "Indicadores calculados com os limites de dose mais restritivos "
+                "do Arm II: V16 Gy (ideal) e V20 Gy (aceitável) para o constraint 1; "
+                "V8 Gy para o constraint 2. "
+                f"{escape(side_note)} "
+                "Fonte: tabela Normal Tissue Constraints do RTOG 1005 fornecida.",
+                body_style,
+            ),
+            Spacer(1, 3 * mm),
+        ])
+        constraint_rows = _heart_constraint_results(dataframe)
+        constraint_headers = [
+            "Critério",
+            "Mama",
+            "Volume (Arm II)",
+            "Limite",
+            "Medido",
+            "Indicativo",
+        ]
+        constraint_table_data = [[
+            Paragraph(escape(value), header_style)
+            for value in constraint_headers
+        ]]
+        for constraint in constraint_rows:
+            constraint_table_data.append([
+                Paragraph(escape(constraint["Classificação"]), cell_style),
+                Paragraph(escape(constraint["Lateralidade"]), cell_style),
+                Paragraph(escape(constraint["Métrica"]), cell_style),
+                Paragraph(
+                    escape(_format_percent_value(constraint["Limite (%)"])),
+                    cell_style,
+                ),
+                Paragraph(
+                    escape(_format_percent_value(constraint["Medido (%)"])),
+                    cell_style,
+                ),
+                Paragraph(escape(constraint["Status"]), cell_style),
+            ])
+        constraint_table = LongTable(
+            constraint_table_data,
+            colWidths=[25 * mm, 25 * mm, 35 * mm, 25 * mm, 25 * mm, 35 * mm],
+            repeatRows=1,
+            hAlign="LEFT",
+        )
+        constraint_styles = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#244062")),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#a6a6a6")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]
+        status_colors = {
+            "PASSA": colors.HexColor("#d9ead3"),
+            "NÃO PASSA": colors.HexColor("#f4cccc"),
+            "NÃO AVALIADO": colors.HexColor("#fff2cc"),
+        }
+        for index, constraint in enumerate(constraint_rows, start=1):
+            constraint_styles.append((
+                "BACKGROUND",
+                (5, index),
+                (5, index),
+                status_colors[constraint["Status"]],
+            ))
+        constraint_table.setStyle(TableStyle(constraint_styles))
+        story.extend([
+            constraint_table,
+            Spacer(1, 3 * mm),
+            Paragraph(
+                "Vx Gy representa o percentual do volume da área cardíaca que "
+                "recebe dose igual ou superior a x Gy. PASSA/NÃO PASSA compara "
+                "o valor medido com o limite indicado; NÃO AVALIADO indica que "
+                "a ROI da área cardíaca não foi encontrada ou não possui dose válida.",
+                body_style,
+            ),
+        ])
     story.extend([
         Spacer(1, 5 * mm),
         Paragraph("Como o escore é calculado", section_style),
@@ -981,6 +1674,21 @@ def save_report_pdf(
     ])
 
     if volume is not None:
+        isodose_levels = (
+            _rt_dose_isodose_levels(dose_grid)
+            if dose_grid is not None
+            else []
+        )
+
+        class DoseLegendMarker(Flowable):
+            def __init__(self):
+                super().__init__()
+                self.width = 0
+                self.height = 0
+
+            def draw(self):
+                self.canv._dose_legend_requested = True
+
         caption_style = ParagraphStyle(
             "ReportImageCaption",
             parent=body_style,
@@ -1020,7 +1728,9 @@ def save_report_pdf(
                         caption_style,
                     ),
                     ReportImage(
-                        _render_calcification_crop(volume, finding),
+                        _render_calcification_crop(
+                            volume, finding, dose_grid=dose_grid
+                        ),
                         width=55 * mm,
                         height=55 * mm,
                         hAlign="CENTER",
@@ -1036,6 +1746,15 @@ def save_report_pdf(
                 ("LEFTPADDING", (0, 0), (-1, -1), 2),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 2),
             ]))
+            image_caption = (
+                "Cada imagem mostra um recorte de 10 × 10 cm. O contorno "
+                "vermelho delimita a estrutura."
+            )
+            if isodose_levels:
+                image_caption += (
+                    " As linhas contínuas indicam isodoses de 1 Gy, em "
+                    "intervalos de 5 Gy."
+                )
             story.extend([
                 PageBreak(),
                 Paragraph(
@@ -1050,12 +1769,10 @@ def save_report_pdf(
                 Spacer(1, 4 * mm),
                 panel_table,
                 Spacer(1, 3 * mm),
-                Paragraph(
-                    "Cada imagem mostra um recorte de 10 × 10 cm. O contorno "
-                    "vermelho delimita a estrutura.",
-                    caption_style,
-                ),
+                Paragraph(image_caption, caption_style),
             ])
+            if isodose_levels:
+                story.append(DoseLegendMarker())
 
     def draw_page_number(canvas, _document):
         canvas.saveState()
@@ -1082,19 +1799,86 @@ def save_report_pdf(
         )
         canvas.restoreState()
 
-    document.build(story, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
+    if volume is not None and dose_grid is not None and isodose_levels:
+        class DoseLegendCanvas(pdf_canvas.Canvas):
+            def __init__(self, *args, dose_levels, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._dose_levels = dose_levels
+                self._dose_legend_requested = False
+
+            def showPage(self):
+                if self._dose_legend_requested:
+                    self.saveState()
+                    self.setFont("Helvetica-Bold", 6.5)
+                    self.setFillColor(colors.HexColor("#444444"))
+                    self.drawString(11 * mm, 20.5 * mm, "Isodoses (Gy):")
+                    row_count = 3
+                    items_per_row = max(
+                        1,
+                        int(np.ceil(len(self._dose_levels) / row_count)),
+                    )
+                    available_width = page_size[0] - 46 * mm
+                    item_width = available_width / items_per_row
+                    for index, level in enumerate(self._dose_levels):
+                        row_index, column_index = divmod(index, items_per_row)
+                        baseline = (17.5 - row_index * 3.2) * mm
+                        start_x = 35 * mm + column_index * item_width
+                        color = _isodose_color(index)
+                        self.setStrokeColorRGB(*(channel / 255 for channel in color))
+                        self.setLineWidth(1.4)
+                        self.line(
+                            start_x,
+                            baseline + 1.2 * mm,
+                            start_x + 3 * mm,
+                            baseline + 1.2 * mm,
+                        )
+                        self.setFillColor(colors.HexColor("#444444"))
+                        self.setFont("Helvetica", 6)
+                        self.drawString(
+                            start_x + 4 * mm,
+                            baseline,
+                            f"{level:g}",
+                        )
+                    self.restoreState()
+                self._dose_legend_requested = False
+                super().showPage()
+
+        canvas_maker = lambda *args, **kwargs: DoseLegendCanvas(
+            *args,
+            dose_levels=isodose_levels,
+            **kwargs,
+        )
+    else:
+        canvas_maker = pdf_canvas.Canvas
+
+    document.build(
+        story,
+        onFirstPage=draw_page_number,
+        onLaterPages=draw_page_number,
+        canvasmaker=canvas_maker,
+    )
 
 
-def show_results(root, dataframe, volume, structures):
+def show_results(root, dataframe, volume, structures, dose_grid=None):
     dataframe = normalize_results_dataframe(dataframe)
     first_slice = volume.slices[0]
     patient_name = str(getattr(first_slice, "PatientName", "Desconhecido"))
     patient_id = str(getattr(first_slice, "PatientID", "Desconhecido"))
     tomography_date = _tomography_date(first_slice)
     window = tk.Toplevel(root)
-    window.title(f"Resultados - Paciente: {patient_name} (ID: {patient_id})")
+    title = f"Resultados - Paciente: {patient_name} (ID: {patient_id})"
+    if dose_grid is not None:
+        title += (
+            f" | RTDOSE: {dose_grid.path.name} "
+            f"({dose_grid.summation_type})"
+        )
+        if dose_grid.frame_mismatch:
+            title += " | Frames distintos (coordenadas assumidas)"
+    window.title(title)
 
-    columns = ("ROI", AGATSTON_SCORE_COLUMN, "Volume_score", "Interpretação")
+    columns = ["ROI", AGATSTON_SCORE_COLUMN, "Volume_score", "Interpretação"]
+    if DOSE_MEAN_COLUMN in dataframe and DOSE_D0_5CC_COLUMN in dataframe:
+        columns.extend([DOSE_MEAN_COLUMN, DOSE_D0_5CC_COLUMN])
     tree = ttk.Treeview(
         window,
         columns=columns,
@@ -1106,16 +1890,21 @@ def show_results(root, dataframe, volume, structures):
         AGATSTON_SCORE_COLUMN: "Agatston Score",
         "Volume_score": "Volume (mm³)",
         "Interpretação": "Risco",
+        DOSE_MEAN_COLUMN: "Dose média (Gy)",
+        DOSE_D0_5CC_COLUMN: "D0,5cc (Gy)",
     }
     widths = {"ROI": 240, AGATSTON_SCORE_COLUMN: 150,
-              "Volume_score": 150, "Interpretação": 260}
+              "Volume_score": 150, "Interpretação": 260,
+              DOSE_MEAN_COLUMN: 150, DOSE_D0_5CC_COLUMN: 150}
     for column in columns:
         tree.heading(column, text=labels[column])
         tree.column(column, width=widths[column], minwidth=90, stretch=True)
     def copy_results():
         try:
             root.clipboard_clear()
-            root.clipboard_append(results_as_text(dataframe, patient_name, patient_id))
+            root.clipboard_append(
+                results_as_text(dataframe, patient_name, patient_id, dose_grid)
+            )
             root.update()
         except tk.TclError as error:
             messagebox.showerror("Erro", f"Não foi possível copiar os resultados:\n{error}",
@@ -1126,9 +1915,20 @@ def show_results(root, dataframe, volume, structures):
 
     actions = ttk.Frame(window)
     actions.pack(side="bottom", fill="x", padx=10, pady=10)
+    saved_pdf_path = {"value": None}
+
+    def open_saved_pdf():
+        path = saved_pdf_path["value"]
+        if path is None:
+            return
+        try:
+            open_pdf(path)
+        except (OSError, RuntimeError, webbrowser.Error) as error:
+            messagebox.showerror("Erro ao abrir o PDF", str(error), parent=window)
 
     def export_pdf():
-        suggested_name = f"Agatston_{patient_id}.pdf"
+        prefix = "Relatorio_Dose" if dose_grid is not None else "Agatston"
+        suggested_name = f"{prefix}_{patient_id}.pdf"
         safe_name = "".join(
             character if character.isalnum() or character in "-_." else "_"
             for character in suggested_name
@@ -1154,10 +1954,13 @@ def show_results(root, dataframe, volume, structures):
                 analysis_date,
                 volume=volume,
                 structures=structures,
+                dose_grid=dose_grid,
             )
         except (OSError, ValueError, ImportError, RuntimeError) as error:
             messagebox.showerror("Erro ao salvar o PDF", str(error), parent=window)
             return
+        saved_pdf_path["value"] = Path(output_path)
+        open_pdf_button.configure(state="normal")
         messagebox.showinfo(
             "PDF salvo",
             f"O relatório foi salvo em:\n{output_path}",
@@ -1168,8 +1971,23 @@ def show_results(root, dataframe, volume, structures):
         side="left", padx=(0, 8)
     )
     ttk.Button(actions, text="Salvar relatório em PDF...", command=export_pdf).pack(
-        side="left"
+        side="left", padx=(0, 8)
     )
+    open_pdf_button = ttk.Button(
+        actions,
+        text="Abrir PDF gerado",
+        command=open_saved_pdf,
+        state="disabled",
+    )
+    open_pdf_button.pack(side="left", padx=(0, 8))
+    if all(column in dataframe for column in (
+        DOSE_V8_COLUMN, DOSE_V16_COLUMN, DOSE_V20_COLUMN
+    )):
+        ttk.Button(
+            actions,
+            text="Constraints cardíacos...",
+            command=lambda: _show_heart_constraints(window, dataframe),
+        ).pack(side="left")
 
     scrollbar = ttk.Scrollbar(window, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=scrollbar.set)
@@ -1179,10 +1997,16 @@ def show_results(root, dataframe, volume, structures):
     style = ttk.Style(window)
     style.configure("Treeview", rowheight=25)
     for _, row in dataframe.iterrows():
+        values = [
+            _format_dose_value(row[column])
+            if column in {DOSE_MEAN_COLUMN, DOSE_D0_5CC_COLUMN}
+            else row[column]
+            for column in columns
+        ]
         tree.insert(
             "",
             "end",
-            values=tuple(row[column] for column in columns),
+            values=tuple(values),
             tags=(row["Cor"],),
         )
     tree.tag_configure("green", background="lightgreen")
@@ -1191,8 +2015,76 @@ def show_results(root, dataframe, volume, structures):
     tree.tag_configure("red", background="tomato")
     window.update_idletasks()
     window_height = min(520, max(150, window.winfo_reqheight()))
-    _center_window(window, 920, window_height)
+    _center_window(window, 1220 if dose_grid is not None else 920, window_height)
     window.protocol("WM_DELETE_WINDOW", root.destroy)
+
+
+def _show_heart_constraints(parent, dataframe):
+    constraints = _heart_constraint_results(dataframe)
+    laterality = _treatment_laterality(dataframe)
+    window = tk.Toplevel(parent)
+    window.title("Constraints cardíacos — RTOG 1005 (Arm II)")
+    window.transient(parent)
+    window.grab_set()
+    ttk.Label(
+        window,
+        text=(
+            "Arm II: V16 Gy ideal / V20 Gy aceitável (constraint 1) e "
+            "V8 Gy (constraint 2). "
+            + (
+                f"Lateralidade inferida pela estrutura mamária com maior dose "
+                f"média: mama {laterality.lower()}."
+                if laterality
+                else "Lateralidade não identificada; os constraints não serão avaliados."
+            )
+        ),
+        wraplength=880,
+        justify="left",
+    ).pack(fill="x", padx=12, pady=(12, 6))
+    columns = (
+        "Classificação",
+        "Lateralidade",
+        "Métrica",
+        "Limite",
+        "Medido",
+        "Indicativo",
+    )
+    tree = ttk.Treeview(window, columns=columns, show="headings", height=8)
+    widths = (120, 130, 110, 110, 110, 130)
+    for column, width in zip(columns, widths):
+        tree.heading(column, text=column)
+        tree.column(column, width=width, minwidth=80, stretch=True)
+    for constraint in constraints:
+        tree.insert(
+            "",
+            "end",
+            values=(
+                constraint["Classificação"],
+                constraint["Lateralidade"],
+                constraint["Métrica"],
+                _format_percent_value(constraint["Limite (%)"]),
+                _format_percent_value(constraint["Medido (%)"]),
+                constraint["Status"],
+            ),
+            tags=(constraint["Status"],),
+        )
+    tree.tag_configure("PASSA", background="lightgreen")
+    tree.tag_configure("NÃO PASSA", background="tomato")
+    tree.tag_configure("NÃO AVALIADO", background="lightyellow")
+    tree.pack(fill="both", expand=True, padx=12, pady=6)
+    ttk.Label(
+        window,
+        text=(
+            "Vx Gy: percentual do volume da área cardíaca com dose ≥ x Gy. "
+            "Os indicadores são auxiliares e não substituem a revisão clínica."
+        ),
+        wraplength=880,
+        justify="left",
+    ).pack(fill="x", padx=12, pady=6)
+    ttk.Button(window, text="Fechar", command=window.destroy).pack(
+        anchor="e", padx=12, pady=(0, 12)
+    )
+    _center_window(window, 920, 420)
 
 
 def main():
@@ -1263,8 +2155,24 @@ def main():
         root.destroy()
         return
 
-    dataframe, _invalid_contours, _outside_contours = calculate_results(structures, volume)
-    show_results(root, dataframe, volume, structures)
+    dose_grid = _choose_rt_dose_file(root, ct_folder, volume)
+    if dose_grid is None and not messagebox.askyesno(
+        "Sem RTDOSE",
+        "Nenhum RTDOSE foi selecionado. Deseja continuar sem calcular as métricas de dose?",
+        parent=root,
+    ):
+        root.destroy()
+        return
+
+    try:
+        dataframe, _invalid_contours, _outside_contours = calculate_results(
+            structures, volume, dose_grid=dose_grid
+        )
+    except ValueError as error:
+        messagebox.showerror("Erro ao calcular os resultados", str(error), parent=root)
+        root.destroy()
+        return
+    show_results(root, dataframe, volume, structures, dose_grid=dose_grid)
     root.mainloop()
 
 
