@@ -619,38 +619,42 @@ python3 -m pip install reportlab
 ```
 
 Depois de selecionar os RTSTRUCTs, é possível selecionar um arquivo DICOM
-RTDOSE. O relatório passa a incluir a dose média (Gy) e D0,5cc para cada
-estrutura. O RTDOSE precisa conter dose absoluta em Gy ou cGy e cobrir
-integralmente cada estrutura; caso contrário, o cálculo é recusado para evitar
-métricas parciais. Se os Frames of Reference forem diferentes, o cálculo
-prossegue usando diretamente as coordenadas físicas e não aplica registro
-espacial. A tabela `Resultados` do PDF inclui a dose média
-e D0,5cc em Gy para cada estrutura, junto às demais métricas. A dose média é
-ponderada pelo volume dos voxels. D0,5cc é a dose no volume mais quente de
-0,5 cm³ e fica indisponível para estruturas menores que esse volume. Os valores
-representam somente o RTDOSE selecionado e seu `DoseSummationType`; não há soma
-automática de arquivos ou frações. Quando a ROI `Área cardíaca` está presente,
-a janela de resultados e o PDF incluem os constraints cardíacos do RTOG 1005,
-com indicadores PASSA/NÃO PASSA para os critérios ideal e aceitável. A
-lateralidade é inferida pela estrutura mamária com maior dose média; se não
-houver estrutura mamária lateralizada ou houver empate, os constraints ficam
-como NÃO AVALIADO. Todos os volumes V8/V16/V20 são medidos exclusivamente na
-estrutura `Área cardíaca`; a lateralidade mamária define somente quais limites
-do protocolo são comparados. A comparação usa os limiares do Arm II: V16 Gy ideal e
-V20 Gy aceitável no constraint 1; V8 Gy no constraint 2. Os indicadores são
-auxiliares e não substituem a revisão do protocolo e do contexto clínico.
+RTDOSE. A análise do CAC usa somente ROIs cardíacas reconhecidas em português
+ou inglês (área cardíaca, coração, miocárdio, átrios, ventrículos, aorta,
+artéria pulmonar, veia pulmonar e artérias coronárias); ROIs não cardíacas,
+como mamas e pulmões, não entram no escore. A dose média e D0,5cc em Gy são
+apresentadas para cada ROI cardíaca. O RTDOSE precisa conter dose absoluta em Gy
+ou cGy e cobrir integralmente cada estrutura cardíaca; caso contrário, o cálculo
+é recusado para evitar métricas parciais. Se os Frames of Reference forem
+diferentes, o cálculo prossegue usando diretamente as coordenadas físicas e
+não aplica registro espacial. A dose média é ponderada pelo volume dos voxels.
+D0,5cc é a dose no volume mais quente de 0,5 cm³ e fica indisponível para
+estruturas menores que esse volume. Os valores representam somente o RTDOSE
+selecionado e seu `DoseSummationType`; não há soma automática de arquivos ou
+frações. Quando a ROI `Área cardíaca` está presente, a janela e o PDF incluem
+os constraints cardíacos do RTOG 1005, medidos exclusivamente nessa ROI. A
+lateralidade é inferida pela estrutura mamária (nomes como `mama_D`, `mama_E`,
+`breast_right` ou `breast_left`) com maior dose média; as mamas são usadas só
+para essa inferência, não para o escore CAC. Se não houver dose completa de
+estrutura mamária lateralizada ou houver empate, os constraints ficam como
+NÃO AVALIADO. A lateralidade define somente quais limites do protocolo são
+comparados. A comparação usa os limiares do Arm II: V16 Gy ideal e V20 Gy
+aceitável no constraint 1; V8 Gy no constraint 2. Os indicadores são auxiliares
+e não substituem a revisão do protocolo e do contexto clínico.
 
 O PDF é salvo em orientação retrato e inclui a data do estudo da tomografia
 (priorizando `StudyDate` e usando datas DICOM alternativas se necessário) e
 a data local da geração do relatório. A janela de salvamento abre inicialmente
 na pasta que contém a pasta da série CT. Para cada estrutura com Agatston maior
-que zero, o relatório acrescenta uma página com um recorte físico de 10 × 10 cm
+que zero, o relatório acrescenta uma página com um recorte físico de 12 × 12 cm
 do corte, mostrando até os três agrupamentos calcificados com maior
 contribuição ao score. No mesmo corte axial, os centros dos agrupamentos
 selecionados ficam separados por mais de 0,5 cm. O contorno vermelho delimita
 a estrutura analisada. Quando houver RTDOSE, as imagens também mostram linhas
-contínuas de isodose iniciando em 1 Gy e avançando de 5 em 5 Gy, com uma legenda
-no rodapé de cada página de calcificações. Após salvar, use **Abrir PDF gerado**
+contínuas de isodose nos níveis 1 Gy, 2 Gy, 5 Gy, 10 Gy e depois de 5 em 5 Gy,
+com linhas finas coloridas do azul (menor dose) ao vermelho (maior dose). A
+descrição da imagem e uma escala horizontal, com cores acima dos valores de dose,
+aparecem no rodapé de cada página de calcificações. Após salvar, use **Abrir PDF gerado**
 para abrir diretamente o último relatório criado no aplicativo.
 
 Os nomes conhecidos `myocardium`, `atrium_left`, `ventricle_left`,

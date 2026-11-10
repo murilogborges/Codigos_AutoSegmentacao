@@ -217,6 +217,94 @@ class CACDicomTests(unittest.TestCase):
         self.assertAlmostEqual(dose_dataframe.iloc[0][CAC.DOSE_MEAN_COLUMN], 2.5)
         self.assertTrue(np.isnan(dose_dataframe.iloc[0][CAC.DOSE_D0_5CC_COLUMN]))
 
+    def test_analysis_uses_cardiac_rois_and_infers_side_from_breasts(self):
+        volume = self._create_volume()
+        roi_contours = {}
+        contour_data_by_name = {
+            "cardiac_area": [0, 0, 2, 6, 0, 2, 6, 3, 2, 0, 3, 2],
+            "breast_right": [0, 0, 2, 2, 0, 2, 2, 2, 2, 0, 2, 2],
+            "breast_left": [4, 0, 2, 6, 0, 2, 6, 2, 2, 4, 2, 2],
+            "lung_left": [0, 0, 2, 6, 0, 2, 6, 3, 2, 0, 3, 2],
+        }
+        for roi_name, contour_data in contour_data_by_name.items():
+            dataset = _write_rtstruct(
+                self.folder / f"{roi_name}.dcm",
+                self.series_uid,
+                self.frame_uid,
+                contour_data,
+                roi_name=roi_name,
+            )
+            structures, notices = CAC.merge_rtstructs([dataset])
+            self.assertEqual(notices, [])
+            roi_contours.update(structures)
+
+        dose_values = np.zeros((2, 4, 4), dtype=float)
+        dose_values[:, :, 2:] = 10.0
+        dose = CAC.RTDoseVolume(
+            path=self.folder / "dose.dcm",
+            dose_gy=dose_values,
+            origin=np.array([0.0, 0.0, 0.0]),
+            row_direction=np.array([1.0, 0.0, 0.0]),
+            column_direction=np.array([0.0, 1.0, 0.0]),
+            normal=np.array([0.0, 0.0, 1.0]),
+            pixel_spacing=volume.pixel_spacing,
+            frame_offsets=np.array([0.0, 2.0]),
+            frame_uid=self.frame_uid,
+            summation_type="PLAN",
+        )
+
+        dataframe, _, _ = CAC.calculate_results(
+            roi_contours, volume, dose_grid=dose
+        )
+
+        self.assertEqual(dataframe["ROI"].tolist(), ["Área cardíaca"])
+        self.assertEqual(CAC._treatment_laterality(dataframe), "Esquerda")
+        self.assertEqual(
+            CAC._heart_constraint_results(dataframe)[0]["Lateralidade"],
+            "Esquerda",
+        )
+
+    def test_analysis_requires_at_least_one_recognized_cardiac_roi(self):
+        volume = self._create_volume()
+        dataset = _write_rtstruct(
+            self.folder / "breast-only.dcm",
+            self.series_uid,
+            self.frame_uid,
+            [0, 0, 2, 4, 0, 2, 4, 3, 2, 0, 3, 2],
+            roi_name="mama_E",
+        )
+        contours = dataset.ROIContourSequence[0].ContourSequence
+
+        with self.assertRaisesRegex(ValueError, "Nenhuma estrutura cardíaca"):
+            CAC.calculate_results({"mama_E": contours}, volume)
+
+    def test_cardio_roi_filter_accepts_english_and_portuguese_names(self):
+        names = (
+            "cardiac_area",
+            "area_cardiaca",
+            "heart",
+            "coração",
+            "heartchambers_highres",
+            "Câmaras cardíacas",
+            "heart_myocardium",
+            "miocárdio",
+            "heart_atrium_left",
+            "átrio direito",
+            "ventricle_left",
+            "ventri_D",
+            "aorta",
+            "pulmonary_artery",
+            "art_pulm",
+            "coronary_arteries",
+            "art_coron",
+        )
+
+        self.assertTrue(all(CAC._is_cardiac_roi(name) for name in names))
+        self.assertTrue(CAC._is_cardiac_area_roi("cardiac_area"))
+        self.assertTrue(CAC._is_cardiac_area_roi("Área cardíaca"))
+        self.assertFalse(CAC._is_cardiac_roi("mama_E"))
+        self.assertFalse(CAC._is_cardiac_roi("lung_left"))
+
     def test_rt_dose_loads_cgy_as_gy_and_requires_matching_frame(self):
         volume = self._create_volume()
         dose_path = self.folder / "dose.dcm"
@@ -447,6 +535,18 @@ class CACDicomTests(unittest.TestCase):
         self.assertTrue(all(
             row["Lateralidade"] == "Não identificada" for row in constraints
         ))
+
+    def test_isodose_levels_and_palette_follow_dose_order(self):
+        dose = type("Dose", (), {
+            "dose_gy": np.array([[[0.0, 1.0, 2.0, 5.0, 10.0, 15.0]]])
+        })()
+
+        self.assertEqual(
+            CAC._rt_dose_isodose_levels(dose),
+            [1.0, 2.0, 5.0, 10.0, 15.0],
+        )
+        self.assertEqual(CAC._isodose_color(0, 5), (49, 54, 149))
+        self.assertEqual(CAC._isodose_color(4, 5), (165, 0, 38))
 
     def test_rtog_metrics_are_taken_only_from_area_cardiaca(self):
         dataframe = pd.DataFrame([
@@ -808,9 +908,9 @@ class CACDicomTests(unittest.TestCase):
         self.assertEqual(finding["maximum_hu"], 300.0)
         image_bytes = CAC._render_calcification_crop(volume, finding)
         crop = Image.open(image_bytes)
-        self.assertEqual(crop.size, (50, 100))
+        self.assertEqual(crop.size, (120, 120))
         self.assertIn((255, 40, 40), crop.getdata())
-        self.assertNotIn((0, 255, 255), crop.getdata())
+        self.assertNotIn(CAC._isodose_color(0, 2), crop.getdata())
         dose_values = np.broadcast_to(
             np.arange(4, dtype=float)[None, None, :] * 5,
             (2, 4, 4),
@@ -830,9 +930,13 @@ class CACDicomTests(unittest.TestCase):
         dose_image = Image.open(
             CAC._render_calcification_crop(volume, finding, dose_grid=dose_grid)
         )
+        self.assertEqual(
+            CAC._rt_dose_isodose_levels(dose_grid),
+            [1.0, 2.0, 5.0, 10.0, 15.0],
+        )
         self.assertTrue(any(
-            color in dose_image.getdata()
-            for color in ((0, 255, 255), (255, 220, 0), (255, 0, 255))
+            blue > red + 20
+            for red, _green, blue in dose_image.getdata()
         ))
         output_path = self.folder / "report-with-images.pdf"
 
@@ -867,8 +971,14 @@ class CACDicomTests(unittest.TestCase):
         self.assertIn(b"Calcifica", page_content)
         self.assertIn(b"coronary", page_content)
         self.assertIn(b"aorta", page_content)
-        self.assertIn(b"recorte de 10", page_content)
-        self.assertEqual(page_content.count(b"Isodoses"), 2)
+        self.assertIn(b"recorte de 12", page_content)
+        self.assertEqual(page_content.count(b"isodoses"), 2)
+        dose_scale_bars = re.findall(
+            rb"n [\d.]+ ([\d.]+) [\d.]+ 4\.535433 re f\*",
+            page_content,
+        )
+        self.assertGreaterEqual(len(dose_scale_bars), 5)
+        self.assertEqual(len(set(dose_scale_bars[:5])), 1)
         self.assertEqual(page_content.count(b"Calcifica"), 2)
         self.assertEqual(page_content.count(b"Grupo 1"), 2)
         self.assertEqual(page_content.count(b"Grupo 2"), 2)
@@ -910,6 +1020,17 @@ class CACDicomTests(unittest.TestCase):
         clusters = CAC.find_clusters(matrix)
         self.assertEqual(len(clusters), 1)
         self.assertEqual(len(clusters[0]), 10_000)
+
+    def test_cluster_labeling_preserves_diagonal_connectivity_and_size_filter(self):
+        matrix = np.full((8, 8), np.nan)
+        matrix[1, 1:3] = 200
+        matrix[2, 3:5] = 200
+        matrix[6, 6:8] = 200
+
+        clusters = CAC.find_clusters(matrix, min_size=4)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(len(clusters[0]), 4)
 
     def test_nonuniform_slice_spacing_is_supported(self):
         _write_ct(self.folder / "z0.dcm", self.series_uid,

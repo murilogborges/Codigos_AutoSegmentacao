@@ -44,21 +44,80 @@ ARTICLE_REFERENCE_ABNT = (
 )
 ROI_TRANSLATIONS = {
     "cardiac_area": "Área cardíaca",
+    "area_cardiaca": "Área cardíaca",
+    "heart": "Coração",
     "aorta": "Aorta",
+    "heartchambers_highres": "Câmaras cardíacas",
+    "coronary_artery": "Artérias coronárias",
+    "coronary_arteries": "Artérias coronárias",
+    "art_coron": "Artérias coronárias",
     "myocardium": "Miocárdio",
     "heart_myocardium": "Miocárdio",
+    "miocardio": "Miocárdio",
     "atrium_left": "Átrio esquerdo",
     "heart_atrium_left": "Átrio esquerdo",
+    "atri_e": "Átrio esquerdo",
     "atrium_right": "Átrio direito",
     "heart_atrium_right": "Átrio direito",
+    "atri_d": "Átrio direito",
     "ventricle_left": "Ventrículo esquerdo",
     "heart_ventricle_left": "Ventrículo esquerdo",
+    "ventri_e": "Ventrículo esquerdo",
     "ventricle_right": "Ventrículo direito",
     "heart_ventricle_right": "Ventrículo direito",
+    "ventri_d": "Ventrículo direito",
     "pulmonary_artery": "Artéria pulmonar",
+    "art_pulm": "Artéria pulmonar",
+    "pulmonary_vein": "Veia pulmonar",
+    "veia_pulm": "Veia pulmonar",
     "artéria pulmonar": "Artéria pulmonar",
-    "coronary_arteries": "Artérias coronárias",
 }
+CARDIAC_ROI_NAMES = {
+    "area cardiaca",
+    "cardiac area",
+    "heart",
+    "coracao",
+    "aorta",
+    "heartchambers highres",
+    "heart chambers highres",
+    "camaras cardiacas",
+    "coronary",
+    "coronary artery",
+    "coronary arteries",
+    "arteria coronaria",
+    "arterias coronarias",
+    "art coron",
+    "myocardium",
+    "heart myocardium",
+    "miocardio",
+    "atrium left",
+    "heart atrium left",
+    "left atrium",
+    "atrio esquerdo",
+    "atri e",
+    "atrium right",
+    "heart atrium right",
+    "right atrium",
+    "atrio direito",
+    "atri d",
+    "ventricle left",
+    "heart ventricle left",
+    "left ventricle",
+    "ventriculo esquerdo",
+    "ventri e",
+    "ventricle right",
+    "heart ventricle right",
+    "right ventricle",
+    "ventriculo direito",
+    "ventri d",
+    "pulmonary artery",
+    "arteria pulmonar",
+    "art pulm",
+    "pulmonary vein",
+    "veia pulmonar",
+    "veia pulm",
+}
+CARDIAC_AREA_ROI_NAMES = {"area cardiaca", "cardiac area"}
 LEGACY_AGATSTON_SCORE_COLUMN = "Agatson_score"
 READ_ERRORS = (InvalidDicomError, OSError, EOFError, ValueError)
 PIXEL_ERRORS = (AttributeError, OSError, RuntimeError, ValueError, NotImplementedError)
@@ -701,10 +760,10 @@ def _normalize_roi_name(name):
 
 
 def _breast_laterality(name):
-    normalized = _normalize_roi_name(name)
+    normalized = _normalized_roi_key(name)
     if "mama" not in normalized and "breast" not in normalized:
         return None
-    tokens = normalized.replace("-", "_").replace(" ", "_").split("_")
+    tokens = normalized.split()
     if any(token in {"e", "esq", "esquerda", "esquerdo", "left", "l"} for token in tokens):
         return "Esquerda"
     if any(token in {"d", "dir", "direita", "direito", "right", "r"} for token in tokens):
@@ -713,6 +772,8 @@ def _breast_laterality(name):
 
 
 def _treatment_laterality(dataframe):
+    if "treatment_laterality" in dataframe.attrs:
+        return dataframe.attrs["treatment_laterality"]
     if DOSE_MEAN_COLUMN not in dataframe:
         return None
     candidates = []
@@ -733,9 +794,7 @@ def _treatment_laterality(dataframe):
 
 def _heart_constraint_results(dataframe):
     cardiac_rows = dataframe[
-        dataframe["ROI"].map(
-            lambda name: _normalize_roi_name(name) == "area cardiaca"
-        )
+        dataframe["ROI"].map(_is_cardiac_area_roi)
     ]
     cardiac_row = cardiac_rows.iloc[0] if not cardiac_rows.empty else None
     laterality = _treatment_laterality(dataframe)
@@ -964,37 +1023,36 @@ def get_mask_from_contours(contours, volume):
 
 def find_clusters(matrix, threshold=129, min_size=4):
     active = np.isfinite(matrix) & (matrix > threshold)
-    visited = np.zeros(active.shape, dtype=bool)
-    clusters = []
-    rows, columns = active.shape
-    neighbors = ((-1, -1), (-1, 0), (-1, 1), (0, -1),
-                 (0, 1), (1, -1), (1, 0), (1, 1))
-    for row, column in np.argwhere(active):
-        if visited[row, column]:
-            continue
-        visited[row, column] = True
-        stack = [(int(row), int(column))]
-        cluster = []
-        while stack:
-            current_row, current_column = stack.pop()
-            cluster.append((current_row, current_column))
-            for d_row, d_column in neighbors:
-                next_row = current_row + d_row
-                next_column = current_column + d_column
-                if (0 <= next_row < rows and 0 <= next_column < columns
-                        and active[next_row, next_column]
-                        and not visited[next_row, next_column]):
-                    visited[next_row, next_column] = True
-                    stack.append((next_row, next_column))
-        if len(cluster) >= min_size:
-            clusters.append(cluster)
-    return clusters
+    labels = measure.label(active, connectivity=2, background=0)
+    component_sizes = np.bincount(labels.ravel())
+    valid_labels = np.flatnonzero(component_sizes >= min_size)
+    valid_labels = valid_labels[valid_labels != 0]
+    if not len(valid_labels):
+        return []
+
+    coordinates = np.argwhere(labels)
+    component_labels = labels[coordinates[:, 0], coordinates[:, 1]]
+    order = np.argsort(component_labels, kind="stable")
+    coordinates = coordinates[order]
+    component_labels = component_labels[order]
+    group_starts = np.searchsorted(component_labels, valid_labels)
+    return [
+        [
+            (int(row), int(column))
+            for row, column in coordinates[
+                start:start + component_sizes[label]
+            ]
+        ]
+        for label, start in zip(valid_labels, group_starts)
+    ]
 
 
 def agatson_score(filtered_array, cluster, volume, slice_index):
     pixel_area = volume.pixel_spacing[0] * volume.pixel_spacing[1]
-    maximum = max(float(filtered_array[row, column]) for row, column in cluster)
-    area_score = len(cluster) * pixel_area
+    coordinates = np.asarray(cluster, dtype=int)
+    values = filtered_array[coordinates[:, 0], coordinates[:, 1]]
+    maximum = float(np.max(values))
+    area_score = len(coordinates) * pixel_area
     volume_score = area_score * volume.slice_spacings[slice_index]
     if 130 <= maximum <= 199:
         weighted_score = area_score
@@ -1009,11 +1067,81 @@ def agatson_score(filtered_array, cluster, volume, slice_index):
     return round(weighted_score, 1), round(volume_score, 1)
 
 
+def _normalized_roi_key(name):
+    normalized = _normalize_roi_name(name)
+    return " ".join(normalized.replace("_", " ").replace("-", " ").split())
+
+
+def _is_cardiac_roi(name):
+    return _normalized_roi_key(name) in CARDIAC_ROI_NAMES
+
+
+def _is_cardiac_area_roi(name):
+    return _normalized_roi_key(name) in CARDIAC_AREA_ROI_NAMES
+
+
+def _infer_treatment_laterality(structures, volume, dose_grid):
+    if dose_grid is None:
+        return None
+    highest_dose_by_side = {}
+    for roi_name, contours in structures.items():
+        side = _breast_laterality(roi_name)
+        if side is None:
+            continue
+        mask, _, _ = get_mask_from_contours(contours, volume)
+        rows, columns, slices = np.nonzero(mask)
+        if not len(rows):
+            continue
+        patient_points = (
+            volume.origins[slices]
+            + (columns * volume.pixel_spacing[1])[:, None]
+            * volume.row_direction
+            + (rows * volume.pixel_spacing[0])[:, None]
+            * volume.column_direction
+        )
+        samples, valid = _sample_dose_at_patient_points(patient_points, dose_grid)
+        if not np.all(valid):
+            continue
+        voxel_volumes_cc = (
+            volume.pixel_spacing[0]
+            * volume.pixel_spacing[1]
+            * volume.slice_spacings[slices]
+            / 1000.0
+        )
+        mean_dose = float(np.average(samples, weights=voxel_volumes_cc))
+        highest_dose_by_side[side] = max(
+            mean_dose,
+            highest_dose_by_side.get(side, -np.inf),
+        )
+    if not highest_dose_by_side:
+        return None
+    highest_dose = max(highest_dose_by_side.values())
+    highest_sides = [
+        side
+        for side, dose in highest_dose_by_side.items()
+        if np.isclose(dose, highest_dose, rtol=0, atol=1e-6)
+    ]
+    return highest_sides[0] if len(highest_sides) == 1 else None
+
+
 def calculate_results(structures, volume, dose_grid=None):
     results = []
     invalid_contours = 0
     outside_contours = 0
-    for roi_name, contours in structures.items():
+    cardiac_structures = {
+        name: contours
+        for name, contours in structures.items()
+        if _is_cardiac_roi(name)
+    }
+    if not cardiac_structures:
+        raise ValueError(
+            "Nenhuma estrutura cardíaca reconhecida foi encontrada no RTSTRUCT. "
+            "Verifique os nomes das ROIs."
+        )
+    treatment_laterality = _infer_treatment_laterality(
+        structures, volume, dose_grid
+    )
+    for roi_name, contours in cardiac_structures.items():
         mask, invalid, outside = get_mask_from_contours(contours, volume)
         invalid_contours += invalid
         outside_contours += outside
@@ -1059,6 +1187,7 @@ def calculate_results(structures, volume, dose_grid=None):
     dataframe = pd.DataFrame(results, columns=columns)
     if not dataframe.empty:
         dataframe = dataframe.sort_values(by=AGATSTON_SCORE_COLUMN, ascending=False)
+    dataframe.attrs["treatment_laterality"] = treatment_laterality
     return dataframe, invalid_contours, outside_contours
 
 
@@ -1151,11 +1280,13 @@ def _top_calcifications(contours, volume, limit=3, minimum_distance_mm=5):
             score, _ = agatson_score(masked_slice, cluster, volume, slice_index)
             if score <= 0:
                 continue
-            maximum_hu = max(
-                float(masked_slice[row, column]) for row, column in cluster
-            )
-            center_row = sum(row for row, _ in cluster) / len(cluster)
-            center_column = sum(column for _, column in cluster) / len(cluster)
+            coordinates = np.asarray(cluster, dtype=float)
+            cluster_values = masked_slice[
+                coordinates[:, 0].astype(int),
+                coordinates[:, 1].astype(int),
+            ]
+            maximum_hu = float(np.max(cluster_values))
+            center_row, center_column = np.mean(coordinates, axis=0)
             candidates.append({
                 "score": score,
                 "maximum_hu": maximum_hu,
@@ -1188,26 +1319,38 @@ def _rt_dose_isodose_levels(dose_grid):
     maximum_dose = float(np.max(dose_grid.dose_gy))
     if maximum_dose < 1:
         return []
-    return np.arange(1.0, maximum_dose + 1e-9, 5.0).tolist()
+    levels = [1.0, 2.0]
+    if maximum_dose >= 5:
+        levels.extend(np.arange(5.0, maximum_dose + 1e-9, 5.0).tolist())
+    return [level for level in levels if level <= maximum_dose]
 
 
-def _isodose_color(index):
-    palette = (
-        (0, 255, 255),
-        (255, 220, 0),
-        (255, 0, 255),
-        (0, 220, 80),
-        (255, 100, 0),
-        (80, 140, 255),
-        (255, 60, 60),
-        (190, 255, 0),
-        (255, 255, 255),
-        (150, 80, 255),
+_ISODOSE_PALETTE = (
+    "#313695",
+    "#4575b4",
+    "#74add1",
+    "#abd9e9",
+    "#e0f3f8",
+    "#ffffbf",
+    "#fee090",
+    "#fdae61",
+    "#f46d43",
+    "#d73027",
+    "#a50026",
+)
+
+
+def _isodose_color(index, count):
+    palette_index = (
+        round(index * (len(_ISODOSE_PALETTE) - 1) / (count - 1))
+        if count > 1
+        else 0
     )
-    return palette[index % len(palette)]
+    color = _ISODOSE_PALETTE[palette_index].lstrip("#")
+    return tuple(int(color[offset:offset + 2], 16) for offset in (0, 2, 4))
 
 
-def _render_calcification_crop(volume, finding, size_mm=100, dose_grid=None):
+def _render_calcification_crop(volume, finding, size_mm=120, dose_grid=None):
     try:
         from PIL import Image, ImageDraw
     except ModuleNotFoundError as error:
@@ -1277,22 +1420,45 @@ def _render_calcification_crop(volume, finding, size_mm=100, dose_grid=None):
     rgb[_mask_boundary(structure_crop)] = (255, 40, 40)
     image = Image.fromarray(rgb, mode="RGB")
     if dose_grid is not None and np.isfinite(dose_crop).any():
-        image_draw = ImageDraw.Draw(image)
-        for index, level in enumerate(_rt_dose_isodose_levels(dose_grid)):
-            for contour in measure.find_contours(
-                dose_crop,
-                level,
-                mask=np.isfinite(dose_crop),
-            ):
-                if len(contour) < 2:
-                    continue
-                image_draw.line(
-                    [(float(column), float(row)) for row, column in contour],
-                    fill=_isodose_color(index),
-                    width=2,
-                )
+        levels = _rt_dose_isodose_levels(dose_grid)
+        if levels:
+            line_scale = 5
+            image = image.resize(
+                (image.width * line_scale, image.height * line_scale),
+                resample=Image.Resampling.BICUBIC,
+            )
+            image_draw = ImageDraw.Draw(image)
+            for index, level in enumerate(levels):
+                for contour in measure.find_contours(
+                    dose_crop,
+                    level,
+                    mask=np.isfinite(dose_crop),
+                ):
+                    if len(contour) < 2:
+                        continue
+                    image_draw.line(
+                        [
+                            (float(column) * line_scale, float(row) * line_scale)
+                            for row, column in contour
+                        ],
+                        fill=_isodose_color(index, len(levels)),
+                        width=3,
+                    )
+            image = image.resize(
+                (image.width // line_scale, image.height // line_scale),
+                resample=Image.Resampling.LANCZOS,
+            )
 
     output = BytesIO()
+    display_columns = max(
+        1,
+        int(round(crop_columns * column_spacing / row_spacing)),
+    )
+    if display_columns != crop_columns:
+        image = image.resize(
+            (display_columns, crop_rows),
+            resample=Image.Resampling.BILINEAR,
+        )
     image.save(output, format="PNG")
     output.seek(0)
     return output
@@ -1391,6 +1557,17 @@ def save_report_pdf(
     dataframe = normalize_results_dataframe(dataframe)
     if (volume is None) != (structures is None):
         raise ValueError("Volume CT e estruturas RTSTRUCT devem ser fornecidos juntos.")
+    has_calcification_pages = (
+        volume is not None
+        and pd.to_numeric(
+            dataframe[AGATSTON_SCORE_COLUMN], errors="coerce"
+        ).gt(0).any()
+    )
+    isodose_levels = (
+        _rt_dose_isodose_levels(dose_grid)
+        if has_calcification_pages and dose_grid is not None
+        else []
+    )
     from xml.sax.saxutils import escape
 
     try:
@@ -1431,7 +1608,7 @@ def save_report_pdf(
         rightMargin=11 * mm,
         leftMargin=11 * mm,
         topMargin=12 * mm,
-        bottomMargin=23 * mm,
+        bottomMargin=37 * mm if has_calcification_pages else 23 * mm,
         title=report_title,
         author="CAC",
     )
@@ -1674,20 +1851,14 @@ def save_report_pdf(
     ])
 
     if volume is not None:
-        isodose_levels = (
-            _rt_dose_isodose_levels(dose_grid)
-            if dose_grid is not None
-            else []
-        )
-
-        class DoseLegendMarker(Flowable):
+        class CalcificationFooterMarker(Flowable):
             def __init__(self):
                 super().__init__()
-                self.width = 0
-                self.height = 0
+                self.width = 1
+                self.height = 1
 
             def draw(self):
-                self.canv._dose_legend_requested = True
+                self.canv._calcification_footer_requested = True
 
         caption_style = ParagraphStyle(
             "ReportImageCaption",
@@ -1746,15 +1917,6 @@ def save_report_pdf(
                 ("LEFTPADDING", (0, 0), (-1, -1), 2),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 2),
             ]))
-            image_caption = (
-                "Cada imagem mostra um recorte de 10 × 10 cm. O contorno "
-                "vermelho delimita a estrutura."
-            )
-            if isodose_levels:
-                image_caption += (
-                    " As linhas contínuas indicam isodoses de 1 Gy, em "
-                    "intervalos de 5 Gy."
-                )
             story.extend([
                 PageBreak(),
                 Paragraph(
@@ -1768,11 +1930,8 @@ def save_report_pdf(
                 ),
                 Spacer(1, 4 * mm),
                 panel_table,
-                Spacer(1, 3 * mm),
-                Paragraph(image_caption, caption_style),
             ])
-            if isodose_levels:
-                story.append(DoseLegendMarker())
+            story.append(CalcificationFooterMarker())
 
     def draw_page_number(canvas, _document):
         canvas.saveState()
@@ -1799,51 +1958,74 @@ def save_report_pdf(
         )
         canvas.restoreState()
 
-    if volume is not None and dose_grid is not None and isodose_levels:
-        class DoseLegendCanvas(pdf_canvas.Canvas):
+    if has_calcification_pages:
+        class CalcificationFooterCanvas(pdf_canvas.Canvas):
             def __init__(self, *args, dose_levels, **kwargs):
                 super().__init__(*args, **kwargs)
                 self._dose_levels = dose_levels
-                self._dose_legend_requested = False
+                self._calcification_footer_requested = False
 
             def showPage(self):
-                if self._dose_legend_requested:
+                if self._calcification_footer_requested:
                     self.saveState()
-                    self.setFont("Helvetica-Bold", 6.5)
-                    self.setFillColor(colors.HexColor("#444444"))
-                    self.drawString(11 * mm, 20.5 * mm, "Isodoses (Gy):")
-                    row_count = 3
-                    items_per_row = max(
-                        1,
-                        int(np.ceil(len(self._dose_levels) / row_count)),
+                    footer_text = (
+                        "Cada imagem mostra um recorte de 12 × 12 cm. O contorno "
+                        "vermelho delimita a estrutura."
                     )
-                    available_width = page_size[0] - 46 * mm
-                    item_width = available_width / items_per_row
-                    for index, level in enumerate(self._dose_levels):
-                        row_index, column_index = divmod(index, items_per_row)
-                        baseline = (17.5 - row_index * 3.2) * mm
-                        start_x = 35 * mm + column_index * item_width
-                        color = _isodose_color(index)
-                        self.setStrokeColorRGB(*(channel / 255 for channel in color))
-                        self.setLineWidth(1.4)
-                        self.line(
-                            start_x,
-                            baseline + 1.2 * mm,
-                            start_x + 3 * mm,
-                            baseline + 1.2 * mm,
+                    if self._dose_levels:
+                        footer_text += (
+                            " As linhas contínuas indicam isodoses de 1 Gy, "
+                            "2 Gy, 5 Gy e, depois, em intervalos de 5 Gy."
                         )
+                    footer_style = ParagraphStyle(
+                        "CalcificationFooter",
+                        parent=body_style,
+                        fontSize=6.5,
+                        leading=8,
+                        alignment=TA_CENTER,
+                        textColor=colors.HexColor("#444444"),
+                    )
+                    footer = Paragraph(escape(footer_text), footer_style)
+                    footer_width = page_size[0] - 22 * mm
+                    footer_height = footer.wrap(footer_width, 11 * mm)[1]
+                    footer.drawOn(
+                        self,
+                        11 * mm,
+                        24 * mm + (11 * mm - footer_height) / 2,
+                    )
+                    if self._dose_levels:
+                        scale_left = 11 * mm
+                        scale_width = page_size[0] - 22 * mm
+                        cell_width = scale_width / len(self._dose_levels)
+                        self.setFont("Helvetica", 5.5)
                         self.setFillColor(colors.HexColor("#444444"))
-                        self.setFont("Helvetica", 6)
-                        self.drawString(
-                            start_x + 4 * mm,
-                            baseline,
-                            f"{level:g}",
-                        )
+                        for index, level in enumerate(self._dose_levels):
+                            center_x = scale_left + (index + 0.5) * cell_width
+                            color = _isodose_color(index, len(self._dose_levels))
+                            self.setFillColorRGB(
+                                *(channel / 255 for channel in color)
+                            )
+                            bar_width = cell_width * 0.82
+                            self.rect(
+                                center_x - bar_width / 2,
+                                17 * mm,
+                                bar_width,
+                                1.6 * mm,
+                                stroke=0,
+                                fill=1,
+                            )
+                            self.setFillColor(colors.HexColor("#444444"))
+                            label = f"{level:g}"
+                            self.drawCentredString(
+                                center_x,
+                                14 * mm,
+                                label,
+                            )
                     self.restoreState()
-                self._dose_legend_requested = False
+                self._calcification_footer_requested = False
                 super().showPage()
 
-        canvas_maker = lambda *args, **kwargs: DoseLegendCanvas(
+        canvas_maker = lambda *args, **kwargs: CalcificationFooterCanvas(
             *args,
             dose_levels=isodose_levels,
             **kwargs,
