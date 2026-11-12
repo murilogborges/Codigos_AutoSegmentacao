@@ -1,665 +1,631 @@
-# Processamento automático de pacientes DICOM
+# Ferramentas de segmentação e análise de DICOM
 
-Este repositório automatiza uma cadeia de segmentação e consolidação de
-RTSTRUCTs de um paciente. O ponto de entrada é `Process_DICOMFolder.sh`: ele
-recebe uma pasta contendo uma série DICOM, identifica o grupo pelo nome da
-pasta final e encaminha o paciente para o fluxo MAMA, META ou PELVE.
+Este repositório reúne três ferramentas: processamento automático com
+TotalSegmentator (`Process_DICOMFolder.sh`), cálculo do escore de Agatston e
+análise opcional de dose em `CAC.py`, e comparação 3D de RTSTRUCTs/DVH em
+`rt_dvh_app.py`.
 
-> **Importante:** TotalSegmentator e os scripts deste repositório são
-> ferramentas de processamento, não substituem revisão clínica. Confirme os
-> resultados no visualizador DICOM apropriado. Verifique também se os termos
-> de uso dos modelos permitem o uso pretendido e se o ambiente cumpre as regras
-> de segurança e privacidade dos dados de saúde.
+> **Atenção:** os resultados são auxiliares e não substituem a revisão das
+> imagens e estruturas por profissionais qualificados. Não use os resultados
+> para decisões clínicas sem validação apropriada. Trabalhe apenas com dados
+> cujo uso tenha sido autorizado e proteja as informações de saúde.
 
-## 1. Preparar o ambiente
+## 1. Pré-requisitos — comandos para copiar e colar
 
-### 1.1. TotalSegmentator
+Escolha o bloco adequado ao que pretende executar. Os comandos Linux devem ser
+executados no Ubuntu ou no Ubuntu do WSL, na pasta do repositório. O
+processamento automático usa scripts Bash e **não funciona diretamente no
+PowerShell ou no Prompt de Comando do Windows**.
 
-Consulte sempre as instruções de instalação e compatibilidade mais recentes
-na [documentação oficial do TotalSegmentator](https://github.com/wasserth/TotalSegmentator).
-O repositório oficial documenta instalação, versões do Python/PyTorch,
-configuração de GPU/CPU, tarefas disponíveis, opções de linha de comando e
-download dos modelos. A instalação padrão é feita via `pip`, mas o comando
-exato pode depender do sistema operacional e da versão CUDA instalada; siga
-as instruções oficiais em vez de copiar uma instalação de outra máquina.
+### 1.1. Ubuntu ou WSL — pipeline automático, `CAC.py` e visualizador DVH
 
-Depois de ativar o ambiente virtual em que o TotalSegmentator foi instalado,
-confirme que os comandos e módulos estão disponíveis:
+O bloco instala Python, suporte a janelas e as dependências usadas pelas três
+ferramentas. A instalação do TotalSegmentator também configura o PyTorch
+necessário; o primeiro uso pode baixar modelos grandes e levar tempo.
 
 ```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv python3-tk git
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install TotalSegmentator numpy pandas pydicom rt-utils scipy shapely opencv-python-headless scikit-image matplotlib reportlab pillow
+```
+
+Mantenha o ambiente virtual ativado em cada novo terminal antes de executar os
+programas. Se estiver usando GPU NVIDIA, confira as instruções oficiais do
+PyTorch e do TotalSegmentator para instalar a combinação compatível com o
+driver/CUDA da máquina; não copie configurações de CUDA de outro computador.
+Para abrir as janelas gráficas no WSL, use uma instalação com suporte a WSLg
+ou configure um servidor gráfico compatível.
+
+### 1.2. Windows — somente `CAC.py`
+
+Este bloco é para usar a janela de cálculo CAC no Windows sem WSL. Execute no
+PowerShell, a partir da pasta do repositório. Instale antes o Python 3.12 para
+Windows com suporte a Tcl/Tk; não é necessário instalar TotalSegmentator para
+usar apenas o `CAC.py`.
+
+```powershell
+py -3.12 -m venv .venv-cac
+& ".\.venv-cac\Scripts\python.exe" -m pip install --upgrade pip
+& ".\.venv-cac\Scripts\python.exe" -m pip install numpy pandas pydicom scikit-image reportlab pillow
+& ".\.venv-cac\Scripts\python.exe" CAC.py
+```
+
+O `reportlab` e o `pillow` habilitam a exportação de relatórios PDF com imagens.
+Sem eles, o cálculo pode ser usado, mas a exportação PDF não estará disponível.
+Para executar `rt_dvh_app.py` no Windows, use o procedimento da seção 7.1.
+
+## 2. O que cada ferramenta faz
+
+| Ferramenta | Finalidade | Sistema recomendado |
+|---|---|---|
+| `Process_DICOMFolder.sh` | Executa as segmentações MAMA, META ou PELVE e consolida RTSTRUCTs. | Ubuntu ou WSL |
+| `CAC.py` | Calcula escore de Agatston em ROIs cardíacas e, opcionalmente, métricas de RTDOSE. | Windows, Ubuntu ou WSL com interface gráfica |
+| `rt_dvh_app.py` | Compara RTSTRUCTs em 3D e calcula histogramas dose-volume (DVH). | Windows, Ubuntu ou WSL com interface gráfica |
+
+As ferramentas têm dependências e entradas diferentes. Instale somente o que
+for usar, mas não misture arquivos de pacientes, aquisições ou referências
+espaciais diferentes.
+
+## 3. Instalar o repositório
+
+Se ainda não tiver uma cópia local, abra o terminal escolhido e clone o
+repositório:
+
+```bash
+git clone https://github.com/murilogborges/Codigos_AutoSegmentacao.git
+cd Codigos_AutoSegmentacao
+```
+
+Se o repositório já estiver no computador, apenas abra o terminal na pasta que
+contém `Process_DICOMFolder.sh`, `CAC.py` e `rt_dvh_app.py`. No Windows, abra o
+Ubuntu/WSL para executar os scripts Bash; a unidade `C:` costuma estar
+disponível no WSL em `/mnt/c/`, e outras unidades aparecem sob `/mnt/` conforme
+a configuração local.
+
+### 3.1. Conferir a instalação do ambiente Linux
+
+Com o ambiente virtual ativado, valide os comandos e bibliotecas:
+
+```bash
+command -v python3
 command -v TotalSegmentator
 TotalSegmentator --help
-python3 -c 'import cv2, numpy, pydicom, rt_utils, scipy, shapely'
+python -c "import cv2, matplotlib, numpy, pandas, pydicom, rt_utils, scipy, shapely, skimage"
 ```
 
-O lançador usa `python3` para chamar os utilitários Python. Depois de instalar
-o TotalSegmentator conforme a documentação oficial, instale os pacotes
-adicionais usados pelos scripts no mesmo ambiente que fornece o `python3`
-encontrado no `PATH`:
+Esses comandos confirmam que o executável e os módulos estão disponíveis no
+mesmo ambiente. Se algum comando falhar, corrija a instalação antes de
+processar imagens.
+
+### 3.2. Manter o GitHub e os computadores sincronizados
+
+O Git mantém um histórico local e o GitHub guarda uma cópia remota. Os três
+comandos têm funções diferentes:
+
+- **`git pull`** baixa e integra no computador os commits que já estão no
+  GitHub. Use ao começar a trabalhar e antes de continuar em outro computador.
+- **`git commit`** registra no histórico local um conjunto de alterações.
+  Use depois de editar e conferir arquivos relacionados. O commit, sozinho,
+  **não** envia nada ao GitHub.
+- **`git push`** envia ao GitHub commits locais que ainda não foram publicados.
+  Use depois de criar e conferir um commit.
+
+O Git não envia automaticamente arquivos ainda não commitados. Além disso,
+não sincroniza por si só cópias independentes do repositório, mesmo que elas
+estejam em computadores diferentes: para isso, faça `push` na cópia que
+recebeu as alterações e depois `pull` na outra.
+
+#### Preparação: clonar ou conferir o repositório
+
+Se ainda não existe uma cópia local, clone uma vez. No Ubuntu/WSL:
 
 ```bash
-python3 -m pip install numpy pydicom scipy shapely rt-utils opencv-python
+git clone https://github.com/murilogborges/Codigos_AutoSegmentacao.git
+cd Codigos_AutoSegmentacao
 ```
 
-O TotalSegmentator também depende de PyTorch e de arquivos de modelo; use as
-instruções oficiais para configurá-los corretamente no computador, em
-particular quando houver GPU/CUDA. O primeiro uso pode baixar pesos e exigir
-acesso à rede. Não execute uma instalação nova diretamente em um ambiente
-clínico sem antes validar a versão e as permissões aplicáveis.
+No PowerShell do Windows, use os mesmos comandos:
 
-### 1.2. Instalação por plataforma e execução no IFGW
+```powershell
+git clone https://github.com/murilogborges/Codigos_AutoSegmentacao.git
+Set-Location Codigos_AutoSegmentacao
+```
 
-O procedimento interno de instalação recomenda Python 3.12. No Windows, é
-possível usar Python instalado pela Microsoft Store ou executar o fluxo em
-Ubuntu pelo WSL. Para Windows nativo, verifique também os runtimes do
-Microsoft Visual C++ (incluindo os requisitos de compatibilidade das
-dependências instaladas); a disponibilidade e a versão necessárias podem
-mudar conforme Python, PyTorch e TotalSegmentator. O documento de origem
-menciona o runtime Visual C++ 2008 e as versões atuais para Visual Studio
-2017–2026; confirme quais são realmente exigidos pelas dependências da
-instalação atual. Para configurar WSL em uma máquina Windows, o procedimento
-interno começa com `wsl --install` e a instalação de Ubuntu, seguida da
-reinicialização indicada pelo instalador. No Ubuntu, o documento interno
-propõe criar um ambiente virtual e instalar as dependências nele:
+Se a pasta já existe, abra o terminal **dentro dela** e confirme que é um
+repositório e que o remoto está configurado:
+
+```text
+git status
+git remote -v
+git branch --show-current
+```
+
+`git remote -v` deve mostrar o endereço do GitHub. Se não houver remoto, peça
+ao responsável pelo repositório o endereço correto antes de configurar um.
+Não inclua senhas ou tokens em comandos, arquivos ou mensagens. Ao pedir
+autenticação, use o mecanismo seguro configurado para GitHub (por exemplo,
+Git Credential Manager ou chave SSH).
+
+Se esta for a primeira vez que fará commits neste computador, configure o nome
+e o e-mail associados ao seu histórico. Use seu próprio nome e o e-mail
+cadastrado no GitHub:
+
+```text
+git config --global user.name "Seu Nome"
+git config --global user.email "seu-email@example.com"
+```
+
+#### Rotina recomendada no Ubuntu/WSL
+
+Execute os comandos na pasta do repositório. Ao abrir um terminal novo, entre
+na pasta e ative o ambiente Python se for executar os programas:
 
 ```bash
-sudo apt install python3 python3-pip
-python3 -m venv ambientePython
-ambientePython/bin/pip install TotalSegmentator rt_utils
+cd /caminho/para/Codigos_AutoSegmentacao
+git status
+git pull --ff-only
 ```
 
-Nos servidores do IFGW, siga primeiro o procedimento institucional de acesso
-ao gateway e ao servidor de processamento. O fluxo documentado usa SSH com
-encaminhamento pelo gateway, ativa o ambiente Python gerenciado pelo `pyenv`
-(no tutorial de referência, `31214`) e instala `TotalSegmentator`,
-`rt_utils`, `numpy`, `pydicom` e `bz2file` nesse ambiente. Os nomes de host,
-contas, chaves e instruções de autenticação devem ser obtidos do manual
-institucional autorizado, não registrados neste README nem compartilhados.
-Para transferir os estudos, o procedimento usa WinSCP com SFTP e túnel SSH;
-proteja as credenciais e confirme que o túnel está configurado conforme a
-política local.
-
-### 1.3. Preparar e exportar o estudo no 3D Slicer
-
-O fluxo de trabalho descrito no documento fornecido separa os dados originais,
-as imagens preparadas no Slicer e os resultados do TotalSegmentator:
-
-1. Exporte do XiO os arquivos DICOM usando a opção de anonimização do DICOM
-   Export e guarde a entrada em `0_CT_XIO`.
-2. Importe o estudo no 3D Slicer pelo botão **Import DICOM files**. Instale
-   as extensões apropriadas usando o gerenciador de extensões. A lista
-   ilustrada no documento inclui NNUNet, PyTorch, SlicerPythonTestRunner,
-   SlicerRT, SlicerRadiomics e TotalSegmentator; confirme na documentação
-   atual quais delas são necessárias para a tarefa que será executada.
-3. Na sequência DICOM do Slicer, selecione o estudo e use **Export to
-   DICOM...**. Escolha um tipo de exportação que preserve as imagens CT
-   (a captura do procedimento mostra a opção `RT (50%, 7 series)`).
-4. Guarde em `1_CT_SLICER` somente as instâncias de imagem CT: não inclua
-   RTDOSE nem RTSTRUCT nessa pasta de entrada do processamento.
-5. Transfira a pasta CT preparada ao servidor autorizado, execute a
-   segmentação e recupere os arquivos DICOM resultantes em
-   `2_TotalSegmentator`.
-
-As capturas abaixo foram selecionadas do documento fornecido; a tela de
-exportação foi recortada para não reproduzir metadados do estudo nem caminhos
-de usuário.
-
-**Importação DICOM no Slicer**
-
-![Botão de importação DICOM do 3D Slicer](docs/images/slicer-import-dicom-button.png)
-
-**Extensões exibidas no documento** — confirme os requisitos da tarefa; nem
-todas as extensões da captura são obrigatórias para todos os fluxos.
-
-<img src="docs/images/slicer-recommended-extensions.png" alt="Extensões exibidas no gerenciador do 3D Slicer" width="480">
-
-**Tipo de exportação DICOM**
-
-![Opções de exportação RT no 3D Slicer](docs/images/slicer-dicom-export-type.png)
-
-### 1.4. Arquivos de entrada
-
-Prepare uma pasta por paciente e aponte para a pasta que contém a série de
-imagens DICOM a processar. Use uma aquisição CT compatível com as tarefas
-configuradas; não misture pacientes nem séries ou aquisições diferentes na
-mesma entrada. Confira previamente se a série está completa e se corresponde
-ao estudo pretendido.
-
-O nome da **pasta final informada** precisa conter exatamente um dos tokens
-`MAMA`, `META` ou `PELVE`, sem diferenciar maiúsculas de minúsculas. Por
-exemplo, `MAMA_Paciente01`, `META01` e `pelve_01` são reconhecidos. Não inclua
-mais de um identificador de grupo no mesmo nome: por exemplo, `META_MAMA01` é
-ambíguo e será recusado. A classificação usa o nome da pasta final, não o
-nome de uma pasta ancestral.
-
-Para MAMA, um indicador de lateralidade adjacente ao identificador numérico
-também pode estar antes ou depois do número do paciente. O lançador reconhece
-`D`, `DIR` ou `LD` como direito e `E`, `ESQ` ou `LE` como esquerdo,
-ignorando `_`, hífenes, espaços e maiúsculas/minúsculas. Exemplos:
-
-| Nome da pasta | Saída final |
-|---|---|
-| `MAMAD01` ou `MAMADIR01` | `GrupoMAMA_LD.dcm` |
-| `MAMA01D`, `MAMA01LD` ou `MAMA01_LD` | `GrupoMAMA_LD.dcm` |
-| `MAMAE01` ou `MAMAESQ01` | `GrupoMAMA_LE.dcm` |
-| `MAMA01E`, `MAMA01LE` ou `MAMA01_LE` | `GrupoMAMA_LE.dcm` |
-| `MAMA01` | `GrupoMAMA.dcm` |
-
-Se a lateralidade aparecer dos dois lados do número e os indicadores forem
-conflitantes, o lançador aborta por ambiguidade, sem iniciar segmentações.
-Caso nenhum indicador seja encontrado, usa o arquivo MAMA sem sufixo.
-
-## 2. Executar o lançador
-
-Na pasta deste repositório, execute:
+Faça `pull` antes de editar para começar com a versão mais recente. A opção
+`--ff-only` evita criar um commit de merge automaticamente quando as duas
+cópias divergiram; se o comando parar, leia a seção **Se houver conflito ou
+divergência** antes de continuar. Ative o ambiente virtual apenas quando for
+executar os programas Python:
 
 ```bash
-./Process_DICOMFolder.sh "/home/borges/META01/"
-./Process_DICOMFolder.sh "/home/borges/MAMA01/"
-./Process_DICOMFolder.sh "/home/borges/PELVE01/"
+source .venv/bin/activate
 ```
 
-Aspas em torno do caminho são recomendadas, especialmente se ele tiver espaços.
-Também é possível fornecer um caminho relativo. Os scripts Python auxiliares
-são encontrados relativamente ao próprio `Process_DICOMFolder.sh`; o comando
-pode ser iniciado de qualquer diretório, desde que o Bash, `python3`,
-`TotalSegmentator` e os pacotes Python estejam disponíveis no `PATH`/ambiente
-ativo.
-
-O fluxo é sequencial. Se uma tarefa de segmentação falhar ou não gerar o
-RTSTRUCT esperado, a tarefa é omitida, seus arquivos parciais com o mesmo
-nome-base (`.dcm`, `.nii` e `.nii.gz`) são removidos, e o processamento
-continua nas demais tarefas. Falhas nas etapas derivadas ou na consolidação
-são informadas; examine as mensagens no terminal antes de tentar novamente.
-
-## 3. Etapas comuns de cada execução
-
-1. **Validar entrada e grupo.** O lançador confirma que a pasta existe e
-   identifica exatamente um dos três grupos aceitos.
-2. **Verificar ferramentas.** Confirma a presença do comando `TotalSegmentator`,
-   de `python3` e dos pacotes Python usados pelos utilitários.
-3. **Proteger e reutilizar resultados.** Para cada tarefa, se o RTSTRUCT
-   correspondente já existir e não estiver vazio, ele é reutilizado e a
-   chamada ao TotalSegmentator é ignorada. Saídas ausentes são processadas.
-   Um RTSTRUCT vazio ou resíduos NIfTI sem o RTSTRUCT correspondente são
-   informados como conflito, sem sobrescrever arquivos.
-4. **Segmentar.** Os scripts chamam TotalSegmentator diretamente sobre a pasta
-   DICOM. A saída normal do TotalSegmentator fica oculta para reduzir o ruído
-   no terminal; se uma tarefa falhar ou não produzir o DICOM esperado, são
-   exibidas as últimas mensagens relevantes do comando.
-5. **Derivar estruturas adicionais.** Conforme o grupo, os utilitários deste
-   repositório separam estruturas, constroem máscaras derivadas ou unificam
-   ROIs.
-6. **Consolidar e verificar.** `unir_rtstructs.py` recebe apenas os RTSTRUCTs
-   efetivamente gerados e preparados. Todas as entradas selecionadas ainda
-   precisam ter referências compatíveis de paciente/estudo, série e Frame of
-   Reference. A consolidação pode ser parcial se tarefas foram omitidas; se
-   nenhuma entrada aproveitável restar, o fluxo termina com erro explícito.
-   O script também verifica a consistência das sequências de ROIs, contornos
-   e observações DICOM no arquivo final.
-
-Durante o processamento, os scripts exibem o percentual concluído do fluxo
-completo (segmentações, etapas derivadas e consolidação). Esse percentual
-avança ao final de cada etapa; por isso, uma tarefa de segmentação longa pode
-permanecer algum tempo no mesmo valor.
-
-## 4. Fluxo MAMA, em detalhe
-
-O lançador chama `MAMA_Segmentations.sh <pasta_DICOM>`.
-
-### 4.1. Segmentações TotalSegmentator
-
-As chamadas são executadas em sequência. `-i` recebe a pasta DICOM, `-o`
-define o nome-base de saída, `-ta` escolhe a tarefa, e
-`-ot dicom_rtstruct` solicita saída RTSTRUCT DICOM. As opções adicionais
-`-ho` e `-bs` permanecem conforme configuradas no pipeline; consulte
-`TotalSegmentator --help` para o significado associado à versão instalada.
-
-| Tarefa (`-ta`) | Nome-base de saída | O que o pipeline usa |
-|---|---|---|
-| `total` com `--roi_subset` | `TOTAL_MAMA.dcm` | Subconjunto de órgãos, pulmões lobares, esôfago, traqueia, tireoide, duodeno, vértebras, úmero, medula, costelas, esterno e cartilagens costais configurado no script. |
-| `breasts` | `BREASTS.dcm` | ROI `breast`, usada para separação por lado. |
-| `heartchambers_highres` | `HEART.dcm` | Câmaras cardíacas, miocárdio, aorta e artéria pulmonar; entrada de `NothingBreaksLikeAHeart.py`. |
-| `coronary_arteries` | `CORO.dcm` | Artérias coronárias. |
-| `body` | `BODY.dcm` | Segmentação de entrada obrigatória para `IHaveABody.py`, que produz `CORPO.dcm`; a ROI `corpo` é obrigatória no resultado consolidado. |
-| `tissue_4_types` | `TISSUE.dcm` | A tarefa é executada e o arquivo fica disponível como intermediário, mas nunca é incluído na consolidação. |
-| `headneck_muscles` | `MUSC.dcm` | Músculos de cabeça/pescoço. |
-| `liver_lesions` | `LIVER.dcm` | Lesões hepáticas. |
-
-Cada tarefa é independente: se, por exemplo, `HEAD.dcm` já estiver presente e
-não vazio, `head_glands_cavities` é reutilizada e não é executada novamente.
-Caso contrário, se a tarefa `head_glands_cavities` retornar
-“Crop is empty” e não produzir `HEAD.dcm`, o script remove os resíduos
-`HEAD.nii`/`HEAD.nii.gz` (e eventual `HEAD.dcm` parcial) silenciosamente e
-segue para as próximas tarefas. As etapas derivadas `BreastSplit.py` e
-`NothingBreaksLikeAHeart.py` só são executadas quando a
-respectiva entrada DICOM foi gerada. `IHaveABody.py` é obrigatória: se
-`BODY.dcm` não for gerado ou não puder produzir `CORPO.dcm`, o fluxo termina
-sem criar um consolidado que omita a estrutura corpo.
-
-Se um `CORPO.dcm` não vazio já existir de uma execução anterior, ele é
-reutilizado no consolidado e tanto a tarefa `body` quanto `IHaveABody.py` são
-puladas. Isso permite retomar a consolidação sem recalcular ou sobrescrever
-essa estrutura.
-
-### 4.2. Estruturas derivadas e consolidação
-
-1. Se `BREASTS.dcm` existir, `BreastSplit.py` sempre o processa novamente e
-   recria `BREASTS_separado.dcm`, mesmo que a saída derivada já exista. Se
-   `BREASTS.dcm` não existir, a tarefa TotalSegmentator `breasts` é executada
-   antes. O utilitário lê a máscara `breast`, separa os lados e cria um
-   RTSTRUCT que contém `Breast_right` e `Breast_left`.
-2. `NothingBreaksLikeAHeart.py HEART.dcm <pasta_DICOM>` combina as máscaras
-   cardíacas e cria ou sobrescreve `Cardiac_area.dcm`. A gravação é atômica:
-   se o reprocessamento falhar antes de terminar, o arquivo anterior é
-   preservado.
-3. `IHaveABody.py BODY.dcm <pasta_DICOM>` combina as estruturas do RTSTRUCT
-   `BODY.dcm` em uma máscara chamada `corpo`, salva em `CORPO.dcm`.
-4. `unir_rtstructs.py` recebe `Cardiac_area.dcm`, `BREASTS_separado.dcm`,
-   `TOTAL_MAMA.dcm`, `CORO.dcm`, `CORPO.dcm`, `MUSC.dcm` e `LIVER.dcm`, e
-   grava `GrupoMAMA.dcm`, `GrupoMAMA_LD.dcm` ou `GrupoMAMA_LE.dcm`, de acordo
-   com o indicador de lateralidade identificado no nome da pasta.
-
-`HEART.dcm` e `BODY.dcm` alimentam as transformações anteriores; não são
-passados diretamente ao unificador. `TISSUE.dcm` também é gerado, mas não está
-na lista de entradas atuais para o arquivo consolidado MAMA.
-
-Se um RTSTRUCT de entrada não contiver `StructureSetROISequence`, o unificador
-ignora esse arquivo e continua com os demais RTSTRUCTs válidos.
-
-## 5. Fluxo META, em detalhe
-
-O lançador chama `META_Segmentations.sh <pasta_DICOM> [arquivo_final]`.
-
-### 5.1. Segmentações TotalSegmentator
-
-| Tarefa (`-ta`) | Nome-base de saída | O que o pipeline usa |
-|---|---|---|
-| `total` | `TOTAL_META.dcm` | Segmentações gerais; também é consultado para decidir se há ROI `brain`. |
-| `body` | `BODY.dcm` | Entrada obrigatória de `IHaveABody.py`; a máscara resultante `CORPO.dcm` integra o arquivo final. |
-| `tissue_4_types` | `TISSUE.dcm` | Tarefa executada; o resultado fica como intermediário e não é passado ao unificador. |
-| `head_glands_cavities` | `HEAD.dcm` | Glândulas e cavidades da cabeça/pescoço. |
-| `liver_lesions` | `LIVER.dcm` | Lesões hepáticas. |
-
-Para cada tarefa, se o respectivo `<nome-base>.dcm` já existir e não estiver
-vazio, ele é reutilizado e a chamada é pulada. Se não existir, o pipeline usa
-`-i <pasta> -o <pasta>/<nome-base> -ta <tarefa> -ot dicom_rtstruct -ho -bs`.
-A saída só é incluída na consolidação se a tarefa terminar sem erro e gerar
-um `.dcm` não vazio. Caso contrário, os arquivos parciais `.dcm`, `.nii` e
-`.nii.gz` daquele nome-base são removidos sem mensagens e as tarefas
-restantes continuam.
-
-### 5.2. Decisão condicional para tarefas cerebrais
-
-Depois de gerar `TOTAL_META.dcm`, o script abre o RTSTRUCT com `pydicom` e
-procura o nome exato de ROI `brain` em `StructureSetROISequence`:
-
-- Se encontrar `brain`, tenta executar `brain_structures` → `BRAIN.dcm`,
-  `head_muscles` → `TONGUE.dcm` e `oculomotor_muscles` → `OPTICS.dcm`.
-  Cada saída é incluída individualmente se gerada; a falha de uma não impede
-  as demais.
-- Se não encontrar `brain`, ou `TOTAL_META.dcm` não tiver sido gerado, informa
-  que as tarefas cerebrais foram omitidas.
-- Se não conseguir ler/verificar o DICOM, informa o problema e omite somente
-  as tarefas cerebrais.
-
-### 5.3. Corpo e arquivo final
-
-`IHaveABody.py BODY.dcm <pasta_DICOM>` combina as ROIs rasterizáveis do
-RTSTRUCT `BODY.dcm` e gera `CORPO.dcm`. Contornos/ROIs individuais inválidos
-são ignorados silenciosamente para permitir a criação da máscara com as
-estruturas válidas restantes; se nenhuma máscara aproveitável restar, a etapa falha.
-Essa etapa é obrigatória: sem `CORPO.dcm`, não é produzido um consolidado
-incompleto. Um `CORPO.dcm` válido de execução anterior é reutilizado. O
-unificador recebe `CORPO.dcm` junto com `TOTAL_META.dcm`, `HEAD.dcm`, as
-entradas cerebrais (se criadas) e `LIVER.dcm`, e exige que a ROI `corpo`
-esteja presente no RTSTRUCT final. `BODY.dcm` é somente entrada do utilitário
-e não é passado diretamente ao unificador; `TISSUE.dcm` é gerado, mas também
-não é passado à união. Por padrão, o resultado é `GrupoMETA.dcm`.
-
-## 6. Fluxo PELVE
-
-PELVE usa as mesmas segmentações, a mesma verificação opcional de `brain` e a
-mesma geração de `CORPO.dcm` do fluxo META. A diferença é o nome do resultado:
-`Process_DICOMFolder.sh` chama
-`META_Segmentations.sh <pasta_DICOM> <pasta_DICOM>/GrupoPELVE.dcm`, portanto
-o consolidado final é `GrupoPELVE.dcm`.
-
-Também é possível chamar diretamente o script compartilhado e informar outro
-caminho final que ainda não exista:
+Depois das alterações, revise e registre somente os arquivos de código ou
+documentação que realmente deseja publicar:
 
 ```bash
-bash META_Segmentations.sh "/dados/PELVE01" "/dados/PELVE01/GrupoPELVE.dcm"
+git status
+git diff
+git add README.md
+git diff --cached
+git commit -m "Atualiza documentação de uso"
+git push
 ```
 
-## 7. Arquivos gerados e comportamento em caso de erro
+Troque `README.md` pelos arquivos que você editou e deseja publicar. Revise
+`git status` e `git diff --cached` antes do commit. Se o `git push` pedir
+autenticação, siga a janela ou o fluxo seguro de autenticação configurado.
 
-Todos os resultados ficam na pasta informada. Os nomes-base de TotalSegmentator
-produzem arquivos com extensão `.dcm`. Os principais arquivos finais são:
+#### Rotina recomendada no Windows (PowerShell)
 
-| Grupo | Arquivo consolidado |
-|---|---|
-| MAMA sem lateralidade indicada | `GrupoMAMA.dcm` |
-| MAMA direita | `GrupoMAMA_LD.dcm` |
-| MAMA esquerda | `GrupoMAMA_LE.dcm` |
-| META | `GrupoMETA.dcm` |
-| PELVE | `GrupoPELVE.dcm` |
+Use os mesmos comandos Git no PowerShell, na pasta clonada:
 
-Arquivos intermediários incluem os RTSTRUCTs de cada tarefa, `CORPO.dcm` e,
-para MAMA, `BREASTS_separado.dcm` e `Cardiac_area.dcm`. Eles não são apagados
-ao final; podem ser úteis para inspeção e rastreabilidade.
+```powershell
+Set-Location "C:\caminho\para\Codigos_AutoSegmentacao"
+git status
+git pull --ff-only
+```
 
-Quando o arquivo final é produzido, a única saída do pipeline é o indicador
-de progresso. Mensagens normais, diagnósticos de tarefas opcionais e avisos
-de contornos/estruturas ignorados ficam ocultos. O processamento cardíaco
-ignora contornos que falhem na validação ou na rasterização OpenCV e continua
-com os contornos restantes. Internamente, RTSTRUCTs das
-tarefas existentes e não vazios são reutilizados sem nova inferência; se uma
-tarefa falhar ou não gerar `.dcm`, seus arquivos parciais `.dcm`, `.nii` e
-`.nii.gz` são removidos silenciosamente e as tarefas seguintes continuam. Se ainda for
-possível consolidar o resultado, a falha daquela tarefa não é impressa. Se
-não for possível gerar o arquivo final, o script informa o erro e mostra o
-diagnóstico relevante. Não remove saídas de outras tarefas nem NIfTIs com
-outros nomes. Uma saída final já existente continua sendo motivo para
-interromper.
+Após editar, revise, selecione os arquivos, faça commit e publique:
 
-O unificador exige que os RTSTRUCTs de entrada apontem para a mesma série e
-Frame of Reference e que sejam compatíveis quanto a paciente/estudo. Isso é
-intencional: não combine saídas de pacientes, aquisições ou referências
-espaciais distintas. Arquivos de entrada sem `StructureSetROISequence` são
-ignorados; se nenhum RTSTRUCT aproveitável restar, não será possível gerar o
-arquivo final. Contornos individuais inválidos são ignorados sem
-mensagens; as demais ROIs continuam sendo processadas. Avisos de estruturas
-derivadas opcionais, como a impossibilidade de criar `tronco`, também ficam
-ocultos no modo normal. Erros fatais só são apresentados quando impedem a
-geração do arquivo consolidado.
+```powershell
+git status
+git diff
+git add README.md
+git diff --cached
+git commit -m "Atualiza documentação de uso"
+git push
+```
 
-No RTSTRUCT consolidado, a sequência começa por `corpo`, `mama_D`, `mama_E`,
-`mama_D_aval` e `mama_E_aval` (quando disponíveis), seguida por `pulmao_D`,
-`pulmao_E`, `pulmoes` e `area_cardiaca` (quando disponíveis). `area_cardiaca`
-usa uma cor vermelho-rosa mais viva para facilitar sua identificação. As
-demais estruturas originais e derivadas são ordenadas da posição mais cranial
-à mais caudal, usando a coordenada superior-inferior dos contornos DICOM. Ao final ficam
-agrupadas as estruturas da coluna vertebral, ordenadas por nível: cervicais
-(C1 em direção a C7), torácicas (T1 em direção a T12), lombares (L1 em direção
-aos níveis disponíveis) e sacrais. Estruturas vertebrais sem nível identificável
-ficam depois dos níveis nomeados, mas ainda no bloco final da coluna.
-Quando o unificador identifica uma ROI direita e sua correspondente esquerda,
-as duas são mantidas lado a lado na sequência; os pares são ordenados pela
-posição cranial-caudal média das duas estruturas, com a direita antes da
-esquerda. Avisos por contornos individuais inválidos são suprimidos enquanto
-os contornos válidos continuam sendo processados. Avisos de estruturas
-derivadas opcionais, como a impossibilidade de criar `tronco`, não aparecem
-no processamento automático. Erros fatais de leitura, referências DICOM
-incompatíveis ou ausência de contornos aproveitáveis são mostrados quando
-impedem gerar o arquivo final.
+Troque `README.md` pelos arquivos que você editou e deseja publicar.
+No Windows, Git for Windows precisa estar instalado e disponível no PowerShell.
+O ambiente Python virtual é independente do Git: `pull`, `commit` e `push`
+não exigem que ele esteja ativado. Ative-o apenas quando for executar o
+programa.
 
-## 8. Comparação interativa de estruturas e DVH
+#### Trabalhar alternando entre Ubuntu/WSL e Windows
 
-O aplicativo `rt_dvh_app.py` oferece uma interface gráfica para comparar
-estruturas e calcular histogramas dose-volume (DVH) a partir de CT, RTSTRUCT
-e RTDOSE. Instale as dependências adicionais no ambiente Python usado para
-executar o aplicativo:
+Escolha uma destas formas:
+
+1. **Uma única cópia de trabalho:** use sempre a mesma pasta do repositório
+   pelo mesmo ambiente. Antes de alternar entre sistemas, feche programas que
+   estejam editando arquivos e confira `git status`. Não faça alterações
+   simultâneas na mesma pasta em dois terminais/sistemas.
+2. **Uma cópia por sistema/computador:** após salvar alterações na primeira
+   cópia, faça `git add`, `git commit` e `git push`. Na outra cópia, execute
+   `git pull --ff-only` antes de editar. O `push` publica o commit e o `pull`
+   o traz para a outra pasta.
+
+Não suponha que uma pasta sincronizada por nuvem substitua o Git. Serviços de
+sincronização de arquivos podem duplicar ou conflitar arquivos internos da
+pasta `.git`; use os comandos Git para sincronizar o histórico.
+
+#### Se houver conflito ou divergência
+
+Se `git pull --ff-only` informar que não é possível avançar, não use
+`git push --force`. Primeiro confira o estado:
+
+```text
+git status
+git log --oneline --decorate -5
+```
+
+Se ainda houver alterações sem commit, revise-as e faça um commit local antes
+de integrar o remoto. Se a divergência for entre commits seus **ainda não
+publicados** e commits novos no GitHub, atualize reaplicando seus commits
+locais sobre o histórico remoto:
+
+```text
+git pull --rebase
+```
+
+Se não houver conflitos, o Git termina a atualização. Depois, publique seus
+commits:
+
+```text
+git push
+```
+
+Se o rebase parar por conflito, use `git status` para ver os arquivos
+indicados. Abra cada um, compare as partes marcadas por `<<<<<<<`, `=======`
+e `>>>>>>>`, escolha o conteúdo correto ou combine as alterações e remova os
+marcadores. Marque cada arquivo resolvido e continue:
+
+```text
+git add caminho/do/arquivo
+git rebase --continue
+```
+
+Repita a resolução enquanto houver conflitos. Para cancelar o rebase e voltar
+ao estado anterior ao início dele, use:
+
+```text
+git rebase --abort
+```
+
+Não reescreva commits que já foram publicados ou que outras pessoas estejam
+usando sem combinar com a equipe. Se não souber qual conteúdo preservar, pare
+e peça ajuda; não descarte alterações para “limpar” o conflito. Se o GitHub
+negar permissão para enviar diretamente à branch atual, crie uma branch e
+envie-a para abrir um pull request:
+
+```text
+git switch -c minha-alteracao
+git push -u origin minha-alteracao
+```
+
+#### O que não publicar
+
+Antes de cada commit, examine a lista de `git status`. **Nunca adicione ao
+GitHub dados DICOM identificáveis, imagens médicas, RTSTRUCTs/RTDOSE de
+pacientes, relatórios com dados pessoais, credenciais, tokens, ambientes
+virtuais (`.venv`) ou arquivos de modelos baixados.** Mantenha dados e
+resultados em pastas fora do repositório ou confirme que estão devidamente
+ignorados; não confie apenas em uma pasta estar “local”.
+
+## 4. Preparar os dados DICOM
+
+### 4.1. Exportar a série CT
+
+1. No sistema de origem (por exemplo, XiO), exporte os arquivos DICOM da
+   aquisição CT. Use a opção de anonimização quando autorizada e exigida pela
+   política institucional. Isso reduz a exposição de identificadores, mas não
+   substitui a revisão de privacidade.
+2. No 3D Slicer, use **Import DICOM files** para importar o estudo. A imagem
+   abaixo indica onde fica a ação de importação.
+
+   ![Botão de importação DICOM do 3D Slicer](docs/images/slicer-import-dicom-button.png)
+
+3. Instale pelo gerenciador de extensões somente as extensões necessárias ao
+   fluxo escolhido. A captura mostra extensões mencionadas no procedimento de
+   referência; a disponibilidade e a necessidade podem mudar conforme a
+   versão do Slicer.
+
+   <img src="docs/images/slicer-recommended-extensions.png" alt="Extensões exibidas no gerenciador do 3D Slicer" width="480">
+
+4. Na sequência DICOM do Slicer, selecione o estudo e escolha **Export to
+   DICOM...**. Use uma opção de exportação que preserve a série de imagens CT.
+   A tela de referência mostra a opção `RT (50%, 7 series)`; confirme que a
+   seleção corresponde ao estudo pretendido.
+
+   ![Opções de exportação DICOM no 3D Slicer](docs/images/slicer-dicom-export-type.png)
+
+5. Confira a pasta exportada. Para os fluxos deste repositório, a entrada deve
+   conter os arquivos da série CT; não use RTDOSE ou RTSTRUCT como se fossem
+   imagens CT. Se houver várias séries, separe-as e escolha conscientemente a
+   série que será processada.
+
+### 4.2. Organizar uma pasta por execução
+
+1. Crie uma pasta exclusiva para uma série CT de um paciente e copie para ela
+   os arquivos da série. Mantenha os arquivos diretamente dentro da pasta, sem
+   misturar séries nem pacientes.
+2. Verifique se a série está completa e se pertence ao exame esperado.
+   Imagens ausentes, cortes duplicados ou geometrias diferentes podem impedir
+   a leitura ou comprometer a associação espacial.
+3. Dê à pasta final um nome que identifique **exatamente um** dos grupos:
+   `MAMA`, `META` ou `PELVE`. A busca não diferencia maiúsculas de
+   minúsculas e considera o nome da pasta que será passado ao comando, não o
+   nome de uma pasta ancestral.
+
+   Exemplos válidos: `MAMA_Paciente01`, `META01`, `pelve_01`. Um nome como
+   `META_MAMA01` é ambíguo e será recusado.
+
+4. Para MAMA, inclua o número do paciente no nome e, se necessário, indique a
+   lateralidade junto ao número. `D`, `DIR` ou `LD` indicam direita; `E`,
+   `ESQ` ou `LE` indicam esquerda. Exemplos: `MAMAD01`,
+   `MAMA01_LD`, `MAMAESQ01` e `MAMA01_LE`. Sem indicação, o arquivo final
+   fica sem sufixo. Indicações conflitantes dos dois lados do número são
+   recusadas.
+
+## 5. Executar o pipeline automático
+
+Ative o ambiente virtual no Ubuntu/WSL e execute o lançador, informando o
+caminho completo da pasta CT. As aspas preservam caminhos com espaços:
 
 ```bash
-python -m pip install -r requirements-dvh.txt
-python rt_dvh_app.py
+bash ./Process_DICOMFolder.sh "/caminho/para/META01"
 ```
 
-O aplicativo requer Python 3.10 ou superior.
+Use um comando por execução e troque somente o caminho pelo da pasta
+preparada:
 
-Na janela, selecione a pasta DICOM. O programa identifica as séries CT, os
-arquivos RTDOSE e os RTSTRUCTs encontrados; o seletor de imagem CT também
-mostra o nome do paciente lido dos metadados DICOM. Se a dose não estiver na
-pasta, use **Procurar RTDOSE...** para selecioná-la em outro local. Escolha
-explicitamente a imagem CT, a dose, o RTSTRUCT de auto-segmentação à esquerda
-e o RTSTRUCT que contém os PTVs à direita. Se existir um RTSTRUCT com nome começando por
-`TOTAL_`, ele é selecionado por padrão para a auto-segmentação; um arquivo
-RTSTRUCT válido começando por `SS` é preferido para o conjunto dos PTVs.
-Se um arquivo não aparecer na lista, use **Abrir RTSTRUCT...** junto ao seletor
-correspondente para carregá-lo manualmente, independentemente do nome/prefixo
-do arquivo. Estruturas com `Isocenter` no nome são removidas dos seletores.
-Os dois painéis de estruturas usam caixas de seleção individuais e barra de
-rolagem. No painel dos PTVs, todas as ROIs contendo `PTV` no nome são
-pré-selecionadas quando disponíveis. Se nenhuma ROI contiver `PTV`, nenhuma
-estrutura é selecionada automaticamente: escolha manualmente a(s) ROI(s) de
-PTV. Após configurar os seletores, clique **Iniciar análise 3D**. O programa
-processa as estruturas primeiro; a janela 3D só é aberta ou exibida quando o
-processamento das superfícies termina. Em seguida, verifica quais ROIs da
-auto-segmentação têm pelo menos 60% do volume dentro da união dos PTVs
-selecionados e pergunta se deseja selecioná-las. Você pode
-aceitar a sugestão e depois ajustar as caixas da esquerda, ou recusá-la e
-manter sua seleção manual. Se nenhuma atingir 60%, o aplicativo informa as
-maiores porcentagens de inclusão; se todas forem zero, orienta verificar
-paciente e espaço físico/Frame of Reference dos RTSTRUCTs. A visualização 3D
-processa apenas as ROIs marcadas; o cálculo DVH também usa apenas essas
-seleções. Para encontrar as candidatas
-com inclusão de pelo menos 60%, o primeiro início da análise precisa rasterizar
-temporariamente as ROIs da esquerda; apenas as escolhidas são mantidas em
-cache e preparadas para a visualização. A lista de percentuais é guardada para
-evitar repetir essa comparação quando as seleções não mudam. Após iniciar a
-análise, a visualização 3D mostra a auto-segmentação à esquerda, a comparação no
-centro e os PTVs à direita. Na comparação, o verde claro representa a
-interseção, o verde escuro o volume auto-segmentado fora dos PTVs e o laranja o
-volume dos PTVs exclusivo. Não há legenda nem rotação automática; os eixos são
-ocultos e a rotação manual em qualquer vista é sincronizada com as demais.
-**Tabela de métricas** abre uma tabela por ROI auto-segmentada: “Dentro do PTV”
-é a porcentagem do volume da ROI automática contida na união dos PTVs
-selecionados. As colunas de margem expandem cada ROI auto-segmentada
-individualmente em 0,5 cm e 1,0 cm e mostram qual porcentagem do volume dos PTVs
-fica coberta por essa expansão; as margens não são aplicadas aos PTVs. A tabela
-também mostra o Dice percentual entre a ROI automática original e a união dos
-PTVs (2 × interseção / soma dos volumes); 100% significa máscaras idênticas.
-**Calcular DVH** abre uma janela separada com gráficos de volume percentual e
-absoluto (cm³). O DVH inclui uma curva para cada estrutura auto-segmentada
-marcada, a união dessas estruturas, expansões de 0,5 cm e 1 cm da união
-auto-segmentada e a união dos PTVs, identificada como **PTV Original**. Assim
-como na tabela, essas margens partem das estruturas auto-segmentadas, não dos
-PTVs; para o DVH, continuam limitadas à estrutura `patient` erodida em 0,5 cm.
+```bash
+bash ./Process_DICOMFolder.sh "/caminho/para/MAMA01"
+bash ./Process_DICOMFolder.sh "/caminho/para/PELVE01"
+```
 
-As estruturas com margem são sempre intersectadas com a estrutura `patient`
-depois de ela ser erodida em 0,5 cm. Se não existir uma ROI com o nome exato
-`patient` nos RTSTRUCTs selecionados, o programa informa a ausência e abre uma
-lista para escolher uma estrutura substituta; a estrutura escolhida também é
-erodida em 0,5 cm antes de limitar as margens. Se a erosão não deixar volume
-útil, escolha um limite anatômico mais amplo. A curva de união sem margem e
-as estruturas individuais não são recortadas por esse limite.
+O resultado e os intermediários são gravados na pasta informada. O lançador
+valida o grupo, confere `TotalSegmentator`, `python3` e as bibliotecas
+necessárias, depois chama o fluxo apropriado. As etapas são sequenciais; o
+percentual de progresso só avança ao terminar uma tarefa, portanto pode ficar
+parado enquanto uma segmentação longa está em execução.
 
-As curvas são calculadas em intervalos de dose de 0,1 Gy. Ao passar o mouse
-sobre um gráfico, uma linha vertical e um rótulo mostram a dose; a legenda
-atualiza o volume percentual ou absoluto correspondente ao lado de cada nome
-de estrutura. A tabela `.csv` exportada usa ponto e vírgula como separador de
-campos e vírgula decimal, adequada às configurações brasileiras de planilhas;
-inclui dose em Gy, volume em cm³ e volume percentual. Use
-**Salvar gráficos DVH (2 PNG)** para salvar os dois gráficos em arquivos
-independentes, um com volume percentual e outro com volume absoluto.
+### 5.1. O que é feito em cada grupo
 
-Os nomes de arquivo dos RTSTRUCTs não precisam coincidir. Se o Frame of
-Reference ou as referências de imagem estiverem ausentes ou divergirem, o
-programa ainda tenta associar os contornos às imagens CT pelas coordenadas
-físicas; essa situação gera um aviso no terminal, não um bloqueio. Confirme
-que os arquivos realmente estão no mesmo espaço físico antes de interpretar
-os resultados. Unidades relativas e séries com espaçamento irregular não são
-aceitas.
-As margens são expansões euclidianas em milímetros, considerando o espaçamento
-dos voxels e limitadas ao `patient` erodido. A ferramenta é para análise e revisão, não para decisão clínica:
-verifique a geometria, as unidades, o registro e os resultados em um sistema
-de planejamento/visualização apropriado antes de qualquer uso clínico.
+**MAMA**
 
-Quando os metadados anunciam Explicit VR, mas o conteúdo do arquivo está em
-Implicit VR, o aplicativo corrige a transferência para leitura como Implicit
-VR Little Endian e registra um aviso no terminal. Outros avisos do pydicom não
-são suprimidos. Arquivos DICOM sem preâmbulo nem prefixo `DICM` são lidos com
-tentativa forçada pelo pydicom; a deteção de tipo ainda é validada pelos
-metadados do arquivo. Se faltar também a Transfer Syntax, ela é inferida do
-encoding dos primeiros elementos DICOM para permitir a decodificação do RTDOSE.
+1. `total` gera `TOTAL_MAMA.dcm` com o subconjunto de estruturas configurado
+   em `MAMA_Segmentations.sh`.
+2. `breasts` gera `BREASTS.dcm`; `BreastSplit.py` separa a ROI em
+   `BREASTS_separado.dcm`, com `Breast_right` e `Breast_left`.
+3. `heartchambers_highres` gera `HEART.dcm`; `NothingBreaksLikeAHeart.py`
+   prepara `Cardiac_area.dcm`.
+4. `coronary_arteries`, `body`, `tissue_4_types`, `headneck_muscles` e
+   `liver_lesions` geram, respectivamente, `CORO.dcm`, `BODY.dcm`,
+   `TISSUE.dcm`, `MUSC.dcm` e `LIVER.dcm`.
+5. `IHaveABody.py` transforma a entrada obrigatória `BODY.dcm` em
+   `CORPO.dcm`. A presença de `CORPO.dcm` é necessária para produzir o
+   consolidado.
+6. `unir_rtstructs.py` combina as entradas preparadas em `GrupoMAMA.dcm`,
+   `GrupoMAMA_LD.dcm` ou `GrupoMAMA_LE.dcm`, conforme o nome da pasta.
 
-O processamento de leitura, visualização, DVH e exportação ocorre em segundo
-plano. O rodapé mostra a etapa atual, o percentual e uma barra de progresso
-determinate, atualizada durante a varredura da pasta, leitura da CT e
-rasterização das ROIs. A leitura da pasta filtra candidatos DICOM e ignora
-diretórios de ambientes Python/cache para evitar tentar abrir arquivos de
-pacotes como imagens. Inconsistências entre VR declarado e encontrado são
-corrigidas pela codificação observada no arquivo e agrupadas em um único
-registro informativo. Ao rasterizar RTSTRUCTs, contornos inválidos ou
-degenerados são ignorados com aviso no terminal; uma ROI sem nenhum contorno
-rasterizável gera erro explícito. Máscaras e malhas recentes são mantidas em
-cache limitado para reduzir o tempo ao alternar estruturas. A malha 3D é
-reduzida à resolução necessária para exibição interativa; os cálculos de DVH
-continuam usando as máscaras DICOM originais. A CT descoberta é carregada a
-partir dos caminhos DICOM indexados, sem nova varredura da pasta, e o RTDOSE é
-decodificado uma única vez por cálculo DVH. As estruturas são posicionadas nas
-coordenadas físicas da CT, incluindo a posição cranio-caudal. Para pontos sem
-dose definida dentro do RTDOSE, o programa não extrapola nem atribui dose
-artificial; não é exibido indicador de porcentagem de cobertura. Se nenhum
-voxel estiver coberto, o cálculo é interrompido. Quando o RTDOSE e a CT
-declaram Frame of Reference diferentes, a interpolação é tentada pelas
-coordenadas físicas numéricas, sem registro espacial; confirme que ambos estão
-no mesmo espaço físico antes de interpretar o DVH. A renderização é feita pela
-CPU do Matplotlib/scikit-image; não é usada GPU nesta versão.
+`HEART.dcm` e `BODY.dcm` são entradas das transformações, não são enviados
+diretamente à consolidação. `TISSUE.dcm` é mantido como intermediário, mas não
+entra no arquivo final.
 
-## 9. Opções, licenças, privacidade e limitações
+**META**
 
-- Cada `-ta` seleciona uma tarefa/modelo diferente do TotalSegmentator.
-  `--roi_subset` limita quais classes são segmentadas pela tarefa `total`;
-  confira a lista mantida em `MAMA_Segmentations.sh` antes de alterá-la.
-- A página oficial informa que as tarefas `heartchambers_highres` e
-  `tissue_4_types` requerem uma licença para uso comercial; há licenças
-  acadêmicas não comerciais disponíveis segundo os termos do projeto. Confirme
-  a licença vigente e os direitos de uso para **cada tarefa** no
-  [repositório oficial](https://github.com/wasserth/TotalSegmentator) e na
-  [página de licenças acadêmicas](https://backend.totalsegmentator.com/license-academic/).
-- O TotalSegmentator pode enviar estatísticas de uso anônimas. A documentação
-  oficial descreve como desativá-las no arquivo de configuração
-  `~/.totalsegmentator/config.json`; consulte-a se a política de dados do
-  ambiente exigir isso.
-- Não envie imagens, identificadores ou outros dados de saúde a serviços
-  externos sem autorização e aprovação institucional. O download dos pesos e
-  o uso de serviços online têm considerações de privacidade próprias.
-- Resultados automáticos podem conter erros, inclusive por diferenças de
-  protocolo, cobertura anatômica, artefatos, contraste ou qualidade da imagem.
-  Não interprete uma segmentação como diagnóstico nem como contorno validado
-  sem revisão adequada.
-- `unir_rtstructs.py` traduz nomes, filtra algumas ROIs, cria estruturas
-  derivadas (por exemplo, pulmões combinados, margem da medula e avaliações
-  anatômicas) e escreve metadados para compatibilidade com o fluxo atual. O
-  resultado consolidado não é uma cópia integral de todos os intermediários.
+1. As tarefas `total`, `body`, `tissue_4_types`, `head_glands_cavities` e
+   `liver_lesions` produzem `TOTAL_META.dcm`, `BODY.dcm`, `TISSUE.dcm`,
+   `HEAD.dcm` e `LIVER.dcm`.
+2. O programa verifica se `TOTAL_META.dcm` contém a ROI chamada exatamente
+   `brain`. Se contiver, tenta também `brain_structures`, `head_muscles` e
+   `oculomotor_muscles`, que geram `BRAIN.dcm`, `TONGUE.dcm` e `OPTICS.dcm`.
+   Essas tarefas são opcionais e independentes: uma falha não impede as
+   demais. Sem a ROI `brain`, as tarefas cerebrais são omitidas.
+3. `IHaveABody.py` cria o obrigatório `CORPO.dcm` a partir de `BODY.dcm`.
+4. A consolidação reúne as entradas disponíveis, incluindo `CORPO.dcm`, em
+   `GrupoMETA.dcm`. `BODY.dcm` e `TISSUE.dcm` não são entradas diretas do
+   unificador.
 
-## 10. Links oficiais e referências bibliográficas
+**PELVE**
 
-### Links
+O grupo PELVE usa as mesmas tarefas e regras do fluxo META. A diferença é o
+nome do arquivo final: `GrupoPELVE.dcm`.
 
-- [TotalSegmentator — repositório, instalação, tarefas, opções e referências](https://github.com/wasserth/TotalSegmentator)
-- [Pesquisa de tarefas/estruturas do TotalSegmentator](https://backend.totalsegmentator.com/find-task/)
-- [Extensão TotalSegmentator para 3D Slicer](https://github.com/lassoan/SlicerTotalSegmentator)
-- [nnU-Net — implementação e documentação](https://github.com/MIC-DKFZ/nnUNet)
+### 5.2. Retomada, arquivos existentes e falhas
 
-### Referências bibliográficas (formato ABNT)
+- Um RTSTRUCT intermediário existente, não vazio e com o nome esperado pode
+  ser reutilizado, evitando repetir a tarefa correspondente.
+- `CORPO.dcm`, se já existir e não estiver vazio, também é reutilizado.
+- O arquivo final **não é sobrescrito**. Se já existir, a execução para para
+  proteger os dados anteriores.
+- RTSTRUCTs vazios e resíduos NIfTI sem o DICOM correspondente são tratados
+  como conflito, não como resultado válido.
+- Se uma tarefa opcional falhar ou não produzir o `.dcm` esperado, o pipeline
+  tenta as demais e remove os arquivos parciais daquela tarefa. A criação do
+  corpo e a consolidação são obrigatórias; falhas nessas etapas interrompem o
+  fluxo e exibem diagnóstico.
+- Para começar uma nova execução limpa, prefira criar uma nova pasta de
+  trabalho. Se for necessário arquivar ou mover saídas antigas, confira cada
+  arquivo antes; não apague a pasta de entrada indiscriminadamente.
 
-As referências abaixo são apresentadas em formato bibliográfico ABNT, com
-acesso direto pelo DOI. O TotalSegmentator recomenda citar também o nnU-Net,
-no qual o projeto se baseia. Os artigos específicos por tarefa são incluídos
-quando a documentação oficial do TotalSegmentator os associa ao módulo
-utilizado no pipeline.
+O unificador verifica se os RTSTRUCTs são compatíveis quanto a paciente,
+estudo, série CT e Frame of Reference. Não combine arquivos de exames ou
+espaços físicos diferentes. Contornos inválidos podem ser ignorados enquanto
+os contornos válidos continuam sendo processados; se não houver entradas
+utilizáveis, não será possível criar o consolidado.
 
-1. WASSERTHAL, Jakob et al. TotalSegmentator: robust segmentation of 104
-   anatomic structures in CT images. *Radiology: Artificial Intelligence*,
-   v. 5, n. 5, e230024, 2023. DOI:
-   [10.1148/ryai.230024](https://doi.org/10.1148/ryai.230024).
-   Referência geral do TotalSegmentator e da tarefa `total`.
-2. ISENSEE, Fabian et al. nnU-Net: a self-configuring method for deep
-   learning-based biomedical image segmentation. *Nature Methods*, v. 18,
-   n. 2, p. 203-211, 2021. DOI:
-   [10.1038/s41592-020-01008-z](https://doi.org/10.1038/s41592-020-01008-z).
-   Método-base recomendado pelo próprio TotalSegmentator.
-3. WALTER, Alexandra et al. Segmentation of 71 anatomical structures
-   necessary for the evaluation of guideline-conforming clinical target
-   volumes in head and neck cancers. *Cancers*, v. 16, n. 2, art. 415, 2024.
-   DOI: [10.3390/cancers16020415](https://doi.org/10.3390/cancers16020415).
-   Referência indicada pelo TotalSegmentator para `head_glands_cavities` e
-   `headneck_muscles`.
-4. NICOLI, Andrew Phillip et al. Liver segment and lesion segmentation on CT
-   and MRI: an open-source contribution to TotalSegmentator. *Journal of
-   Digital Imaging*, v. 39, n. 4, p. 3508-3523, 2026. Publicado online em
-   24 out. 2025. DOI:
-   [10.1007/s10278-025-01716-y](https://doi.org/10.1007/s10278-025-01716-y).
-   Referência indicada para `liver_lesions`.
-5. CAI, Jason C. et al. Fully automated segmentation of head CT neuroanatomy
-   using deep learning. *Radiology: Artificial Intelligence*, v. 2, n. 5,
-   e190183, 2020. DOI:
-   [10.1148/ryai.2020190183](https://doi.org/10.1148/ryai.2020190183).
-   Referência indicada pelo TotalSegmentator como base parcial de
-   `brain_structures`.
+## 6. Análise de Agatston e dose com `CAC.py`
 
-Para `body`, `breasts`, `heartchambers_highres`, `tissue_4_types`,
-`coronary_arteries`, `head_muscles` e `oculomotor_muscles`, a lista oficial de
-tarefas consultada não indica um artigo adicional específico junto a cada
-módulo. Cite a referência geral do TotalSegmentator e não associe a esses
-módulos artigos que a documentação não aponta. Confirme as instruções de
-citação na versão instalada antes de publicar, pois a lista de tarefas e
-referências pode mudar.
+O `CAC.py` abre uma interface gráfica. Ele calcula o escore de Agatston nas
+ROIs cardíacas reconhecidas nos RTSTRUCTs selecionados. Também pode calcular
+métricas de dose se for fornecido um RTDOSE. Não é uma ferramenta de
+segmentação automática.
 
-## Análise interativa de escore de Agatston
-
-O utilitário independente `CAC.py` analisa uma série CT DICOM e estruturas de
-um ou mais RTSTRUCTs. Execute-o no ambiente Python que contém as dependências
-do projeto:
+Inicie-o com o ambiente preparado:
 
 ```bash
 python3 CAC.py
 ```
 
-Escolha a pasta da série CT e, na etapa seguinte, selecione diretamente um ou
-mais arquivos RTSTRUCT compatíveis. Os resultados podem ser copiados como
-texto tabulado, incluindo identificação da paciente, ou salvos como relatório
-PDF. A exportação PDF requer `reportlab`:
+No Windows, use o comando `& ".\.venv-cac\Scripts\python.exe" CAC.py` mostrado
+na seção 1.2.
+
+### 6.1. Passo a passo na janela
+
+1. **Escolha a pasta CT.** Selecione a pasta que contém os arquivos DICOM da
+   série. O programa lê os arquivos nessa pasta, agrupa as imagens por série e
+   valida a geometria.
+2. **Escolha a série.** Se houver mais de uma série CT válida, selecione uma
+   única série. Séries diferentes não são combinadas.
+3. **Selecione um ou mais RTSTRUCTs.** O programa verifica se os arquivos
+   contêm ROIs com contornos e referências à série CT selecionada. Selecione
+   apenas RTSTRUCTs do mesmo estudo e espaço físico.
+4. **Selecione um RTDOSE ou continue sem dose.** Sem RTDOSE, o escore CAC
+   ainda pode ser calculado. Para métricas de dose, o arquivo precisa conter
+   dose física absoluta em Gy ou cGy, estar associado à CT e cobrir
+   integralmente cada estrutura analisada.
+5. **Confira os resultados.** A tabela é ordenada pelo escore. Use **Copiar
+   todos os dados** para copiar os resultados ou **Salvar relatório em
+   PDF...** para exportá-los. Após salvar, **Abrir PDF gerado** abre o relatório
+   mais recente.
+
+### 6.2. Como interpretar as medidas
+
+- São analisadas ROIs cardíacas reconhecidas em português ou inglês, como
+  coração, área cardíaca, miocárdio, átrios, ventrículos, aorta, artérias
+  coronárias, artéria pulmonar e veia pulmonar. ROIs não cardíacas não entram
+  no escore CAC.
+- O algoritmo procura agrupamentos conectados com pelo menos quatro pixels e
+  densidade acima de 129 HU dentro de cada ROI. O escore soma a área dos
+  pixels, ponderada pelo fator de densidade máxima do agrupamento: 130–199 HU
+  (1), 200–299 HU (2), 300–399 HU (3) e 400 HU ou mais (4).
+- O volume associado é calculado com área do pixel e espaçamento entre cortes.
+  Por isso, a geometria e as unidades DICOM precisam estar corretas.
+- A dose média é ponderada pelo volume dos voxels. D0,5cc representa a dose
+  no volume mais quente de 0,5 cm³ e não é calculada para estruturas menores
+  que esse volume. A dose é interpolada nos centros dos voxels CT.
+- O RTDOSE selecionado não é somado a outros arquivos ou frações. Se não
+  cobrir integralmente uma estrutura, as métricas correspondentes são
+  recusadas em vez de calculadas sobre cobertura parcial.
+- Se os Frames of Reference do RTDOSE e da CT forem diferentes, o aplicativo
+  ainda pode tentar amostrar pelas coordenadas físicas numéricas, mas não faz
+  registro espacial. Confirme que ambos estão no mesmo espaço antes de
+  interpretar o resultado.
+- Quando disponível a ROI `Área cardíaca`, o aplicativo também compara V8 Gy,
+  V16 Gy e V20 Gy com limites de referência do RTOG 1005 (Arm II). A
+  lateralidade é inferida pela mama lateralizada com maior dose média; se não
+  for possível identificá-la, os limites não são avaliados. Esses indicadores
+  não substituem a revisão do protocolo clínico.
+
+A exportação de PDF inclui a tabela, a explicação dos fatores do escore e,
+para estruturas com escore maior que zero, recortes CT com calcificações
+destacadas. Instale `reportlab` e `pillow` para habilitar a criação de PDF.
+
+## 7. Comparação 3D e DVH com `rt_dvh_app.py`
+
+O visualizador compara estruturas de RTSTRUCTs e calcula histogramas
+dose-volume. Instale as dependências listadas no repositório:
 
 ```bash
-python3 -m pip install reportlab
+python3 -m pip install -r requirements-dvh.txt
+python3 rt_dvh_app.py
 ```
 
-Depois de selecionar os RTSTRUCTs, é possível selecionar um arquivo DICOM
-RTDOSE. A análise do CAC usa somente ROIs cardíacas reconhecidas em português
-ou inglês (área cardíaca, coração, miocárdio, átrios, ventrículos, aorta,
-artéria pulmonar, veia pulmonar e artérias coronárias); ROIs não cardíacas,
-como mamas e pulmões, não entram no escore. A dose média e D0,5cc em Gy são
-apresentadas para cada ROI cardíaca. O RTDOSE precisa conter dose absoluta em Gy
-ou cGy e cobrir integralmente cada estrutura cardíaca; caso contrário, o cálculo
-é recusado para evitar métricas parciais. Se os Frames of Reference forem
-diferentes, o cálculo prossegue usando diretamente as coordenadas físicas e
-não aplica registro espacial. A dose média é ponderada pelo volume dos voxels.
-D0,5cc é a dose no volume mais quente de 0,5 cm³ e fica indisponível para
-estruturas menores que esse volume. Os valores representam somente o RTDOSE
-selecionado e seu `DoseSummationType`; não há soma automática de arquivos ou
-frações. Quando a ROI `Área cardíaca` está presente, a janela e o PDF incluem
-os constraints cardíacos do RTOG 1005, medidos exclusivamente nessa ROI. A
-lateralidade é inferida pela estrutura mamária (nomes como `mama_D`, `mama_E`,
-`breast_right` ou `breast_left`) com maior dose média; as mamas são usadas só
-para essa inferência, não para o escore CAC. Se não houver dose completa de
-estrutura mamária lateralizada ou houver empate, os constraints ficam como
-NÃO AVALIADO. A lateralidade define somente quais limites do protocolo são
-comparados. A comparação usa os limiares do Arm II: V16 Gy ideal e V20 Gy
-aceitável no constraint 1; V8 Gy no constraint 2. Os indicadores são auxiliares
-e não substituem a revisão do protocolo e do contexto clínico.
+Use Python 3.10 ou superior. A instalação feita na seção 1 já inclui essas
+bibliotecas; o comando acima também serve para instalar ou atualizar somente
+as dependências do visualizador.
 
-O PDF é salvo em orientação retrato e inclui a data do estudo da tomografia
-(priorizando `StudyDate` e usando datas DICOM alternativas se necessário) e
-a data local da geração do relatório. A janela de salvamento abre inicialmente
-na pasta que contém a pasta da série CT. Para cada estrutura com Agatston maior
-que zero, o relatório acrescenta uma página com um recorte físico de 12 × 12 cm
-do corte, mostrando até os três agrupamentos calcificados com maior
-contribuição ao score. No mesmo corte axial, os centros dos agrupamentos
-selecionados ficam separados por mais de 0,5 cm. O contorno vermelho delimita
-a estrutura analisada. Quando houver RTDOSE, as imagens também mostram linhas
-contínuas de isodose nos níveis 1 Gy, 2 Gy, 5 Gy, 10 Gy e depois de 5 em 5 Gy,
-com linhas finas coloridas do azul (menor dose) ao vermelho (maior dose). A
-descrição da imagem e uma escala horizontal, com cores acima dos valores de dose,
-aparecem no rodapé de cada página de calcificações. Após salvar, use **Abrir PDF gerado**
-para abrir diretamente o último relatório criado no aplicativo.
+No Windows, crie um ambiente virtual próprio no PowerShell e execute:
 
-Os nomes conhecidos `myocardium`, `atrium_left`, `ventricle_left`,
-`atrium_right`, `ventricle_right`, `aorta` e `pulmonary_artery` são exibidos em
-português. O relatório explica o fator aplicado por faixa de densidade e as
-faixas de interpretação do escore. O resultado é uma ferramenta auxiliar e
-deve ser conferido por profissional qualificado; não substitui avaliação
-clínica nem revisão das imagens e estruturas DICOM.
+```powershell
+py -3.12 -m venv .venv-dvh
+& ".\.venv-dvh\Scripts\python.exe" -m pip install --upgrade pip
+& ".\.venv-dvh\Scripts\python.exe" -m pip install -r requirements-dvh.txt
+& ".\.venv-dvh\Scripts\python.exe" rt_dvh_app.py
+```
+
+### 7.1. Preparar a análise
+
+1. Na janela, selecione a pasta que contém a série CT, o RTDOSE e os
+   RTSTRUCTs. Se estiverem em pastas diferentes, use os botões de seleção
+   manual para a dose e para cada RTSTRUCT.
+2. Selecione explicitamente a CT, o RTDOSE, o RTSTRUCT de auto-segmentação e
+   o RTSTRUCT dos PTVs. Arquivos com prefixo `TOTAL_` podem ser sugeridos para
+   auto-segmentação; arquivos válidos começando com `SS` podem ser sugeridos
+   para PTVs.
+3. Confira a lista de ROIs. As ROIs com `PTV` no nome são pré-selecionadas
+   quando encontradas. Se nenhuma for selecionada automaticamente, marque
+   manualmente as estruturas corretas.
+4. Clique em **Iniciar análise 3D**. Aguarde o processamento das superfícies;
+   a janela 3D aparece quando essa etapa terminar.
+5. Avalie a sugestão de ROIs automáticas com pelo menos 60% do volume dentro
+   da união dos PTVs. Aceite ou recuse a sugestão e ajuste as caixas de
+   seleção. A visualização e o DVH consideram as estruturas marcadas.
+
+### 7.2. Visualização, tabela e DVH
+
+- A visualização 3D mostra auto-segmentação, comparação e PTVs. Na comparação,
+  verde claro é a interseção, verde escuro é a parte da auto-segmentação fora
+  dos PTVs e laranja é a parte dos PTVs fora da auto-segmentação. A rotação é
+  sincronizada entre as vistas.
+- **Tabela de métricas** informa quanto de cada ROI automática está dentro
+  dos PTVs, o Dice entre cada máscara e a união dos PTVs, e a cobertura dos
+  PTVs por expansões de 0,5 cm e 1 cm das ROIs automáticas. As margens são
+  aplicadas às estruturas automáticas, não aos PTVs.
+- **Calcular DVH** mostra curvas de volume percentual e absoluto (cm³) para
+  cada ROI automática marcada, a união dessas ROIs, as expansões de 0,5 cm e
+  1 cm e a união dos PTVs identificada como **PTV Original**. O passo de dose
+  é 0,1 Gy.
+- As margens são limitadas à ROI `patient` erodida em 0,5 cm. Se ela não
+  existir, o programa permite escolher uma estrutura substituta, que também
+  será erodida. As estruturas individuais e a união sem margem não são
+  recortadas por esse limite.
+- Use a opção de salvar CSV para exportar os dados (separador `;` e vírgula
+  decimal) e **Salvar gráficos DVH (2 PNG)** para salvar os gráficos percentual
+  e absoluto separadamente.
+
+Frame of Reference ou referências de imagem ausentes/diferentes podem gerar
+avisos; o programa pode tentar a associação pelas coordenadas físicas, mas
+isso não equivale a registro. Séries CT com espaçamento irregular e dose sem
+cobertura dos pontos necessários não devem ser interpretadas como se fossem
+válidas.
+
+## 8. Testes do projeto
+
+Com as dependências instaladas e o ambiente virtual ativado, execute a suíte
+de testes:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Os testes verificam partes do processamento DICOM, incluindo ordenação de
+cortes, associação de estruturas, dose e cálculos. Eles não substituem a
+validação visual dos resultados em estudos reais.
+
+## 9. Licenças, privacidade e limitações
+
+- Consulte os termos de uso e licenças de cada tarefa do TotalSegmentator
+  antes de usá-la. Algumas tarefas podem ter restrições específicas, inclusive
+  para uso comercial. Consulte a [documentação oficial do
+  TotalSegmentator](https://github.com/wasserth/TotalSegmentator) e a
+  [página de licenças acadêmicas](https://backend.totalsegmentator.com/license-academic/).
+- O primeiro uso do TotalSegmentator pode baixar pesos de modelo. Verifique
+  as regras de rede e de privacidade da instituição. A documentação oficial
+  explica como configurar as estatísticas de uso.
+- Não envie imagens, identificadores ou outros dados de saúde a serviços
+  externos sem autorização. Proteja também as pastas de entrada, os
+  intermediários e os relatórios gerados.
+- As ferramentas não fazem diagnóstico nem validam automaticamente todos os
+  contornos. Artefatos, protocolo, cobertura anatômica e qualidade da imagem
+  podem afetar os resultados. Confira as imagens, unidades, referências
+  espaciais e estruturas em um visualizador DICOM apropriado.
+- O arquivo consolidado é construído a partir das entradas válidas e das
+  regras do unificador; não é necessariamente uma cópia de todas as estruturas
+  dos RTSTRUCTs originais.
+
+## 10. Referências técnicas
+
+- [TotalSegmentator — instalação, tarefas, opções e licenças](https://github.com/wasserth/TotalSegmentator)
+- [Pesquisa de tarefas e estruturas do TotalSegmentator](https://backend.totalsegmentator.com/find-task/)
+- [Extensão TotalSegmentator para 3D Slicer](https://github.com/lassoan/SlicerTotalSegmentator)
+- [nnU-Net — implementação e documentação](https://github.com/MIC-DKFZ/nnUNet)
+
+O artigo geral do TotalSegmentator é: WASSERTHAL, Jakob et al.
+*TotalSegmentator: robust segmentation of 104 anatomic structures in CT
+images*. Radiology: Artificial Intelligence, v. 5, n. 5, e230024, 2023.
+DOI: [10.1148/ryai.230024](https://doi.org/10.1148/ryai.230024). Consulte a
+documentação da versão utilizada para obter as referências específicas das
+tarefas e dos modelos empregados.

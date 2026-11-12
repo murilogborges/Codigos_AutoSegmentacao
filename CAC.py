@@ -132,6 +132,8 @@ _LONG_VRS = {b"OB", b"OD", b"OF", b"OL", b"OV", b"SQ", b"UC", b"UR", b"UT", b"UN
 
 @dataclass
 class CTVolume:
+    """CT 3D e geometria física necessária para localizar cada voxel."""
+
     series_uid: str
     frame_uid: str
     slices: list[Dataset]
@@ -148,6 +150,8 @@ class CTVolume:
 
 @dataclass
 class RTDoseVolume:
+    """Grade 3D de dose em Gy, com sua posição e orientação DICOM."""
+
     path: Path
     dose_gy: np.ndarray
     origin: np.ndarray
@@ -191,6 +195,8 @@ def _vector(dataset, name, length):
 
 
 def _prepare_slice_geometry(slices):
+    # O produto vetorial dá a normal aos cortes. Projetar cada origem nessa
+    # direção permite ordená-los no espaço do paciente, não pelo nome do arquivo.
     if not slices:
         raise ValueError("A série não contém imagens CT.")
 
@@ -280,6 +286,8 @@ def _prepare_slice_geometry(slices):
 
 
 def scan_ct_series(folder):
+    # Primeiro lemos só os cabeçalhos: assim identificamos séries sem carregar
+    # os pixels de todas as imagens na memória.
     groups = defaultdict(list)
     notices = []
     ignored_count = 0
@@ -341,6 +349,7 @@ def scan_ct_series(folder):
 
 
 def load_ct_volume(series_uid, header_datasets):
+    # CT armazenada pode exigir a transformação HU = pixel * slope + intercept.
     decoded = []
     failures = []
     for header in header_datasets:
@@ -577,6 +586,7 @@ def load_rt_dose(path, volume):
         raise ValueError("O RTDOSE não possui DoseGridScaling válido.") from error
     if not np.isfinite(scale) or scale <= 0:
         raise ValueError("O RTDOSE não possui DoseGridScaling válido.")
+    # DoseGridScaling recupera a dose armazenada; cGy é convertido para Gy.
     dose_gy = pixels * scale * (0.01 if units == "CGY" else 1.0)
     if not np.isfinite(dose_gy).all():
         raise ValueError("A grade RTDOSE contém valores de dose inválidos.")
@@ -637,6 +647,8 @@ def _sample_rt_dose_on_mask(mask, volume, dose_grid, roi_name):
 
 
 def _sample_dose_at_patient_points(points, dose_grid):
+    # Converte coordenadas físicas (mm) para índices da grade RTDOSE.
+    # A interpolação trilinear combina os 8 voxels vizinhos.
     points = np.asarray(points, dtype=float).reshape(-1, 3)
     relative = points - dose_grid.origin
     dose_columns = relative @ dose_grid.row_direction / dose_grid.pixel_spacing[1]
@@ -955,6 +967,7 @@ def _choose_rtstruct_files(root, initial_folder, volume):
 
 
 def merge_rtstructs(rtstructs):
+    # Junta contornos de ROIs com o mesmo nome em diferentes RTSTRUCTs.
     structures = {}
     notices = []
     for dataset in rtstructs:
@@ -976,6 +989,8 @@ def merge_rtstructs(rtstructs):
 
 
 def get_mask_from_contours(contours, volume):
+    # Converte vértices dos contornos, em mm, para pixels da CT e preenche
+    # o polígono no corte correspondente, formando uma máscara booleana 3D.
     rows, columns, slices = volume.image.shape
     mask = np.zeros((rows, columns, slices), dtype=bool)
     invalid_count = 0
@@ -1022,6 +1037,8 @@ def get_mask_from_contours(contours, volume):
 
 
 def find_clusters(matrix, threshold=129, min_size=4):
+    # Rotula componentes 2D: conectividade 8 inclui diagonais; rótulo zero é
+    # o fundo. min_size elimina agrupamentos menores que o limite configurado.
     active = np.isfinite(matrix) & (matrix > threshold)
     labels = measure.label(active, connectivity=2, background=0)
     component_sizes = np.bincount(labels.ravel())
@@ -1048,6 +1065,8 @@ def find_clusters(matrix, threshold=129, min_size=4):
 
 
 def agatson_score(filtered_array, cluster, volume, slice_index):
+    # O escore usa área (mm²) vezes um fator definido pela HU máxima.
+    # O volume (mm³) é calculado separadamente para ser exibido no resultado.
     pixel_area = volume.pixel_spacing[0] * volume.pixel_spacing[1]
     coordinates = np.asarray(cluster, dtype=int)
     values = filtered_array[coordinates[:, 0], coordinates[:, 1]]
@@ -1125,6 +1144,8 @@ def _infer_treatment_laterality(structures, volume, dose_grid):
 
 
 def calculate_results(structures, volume, dose_grid=None):
+    # Só ROIs cardíacas entram no Agatston; a dose, se fornecida, é calculada
+    # na mesma máscara e comparada com os centros dos voxels CT.
     results = []
     invalid_contours = 0
     outside_contours = 0
@@ -1554,6 +1575,7 @@ def save_report_pdf(
     structures=None,
     dose_grid=None,
 ):
+    # A geração do PDF usa bibliotecas opcionais, importadas nesta função.
     dataframe = normalize_results_dataframe(dataframe)
     if (volume is None) != (structures is None):
         raise ValueError("Volume CT e estruturas RTSTRUCT devem ser fornecidos juntos.")
@@ -2270,6 +2292,7 @@ def _show_heart_constraints(parent, dataframe):
 
 
 def main():
+    # Fluxo da interface: CT -> RTSTRUCTs -> RTDOSE opcional -> resultados.
     root = tk.Tk()
     root.withdraw()
     root.report_callback_exception = lambda _type, error, _traceback: messagebox.showerror(
