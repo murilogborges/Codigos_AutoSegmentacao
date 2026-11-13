@@ -2,8 +2,8 @@
 
 Este repositório reúne três ferramentas: processamento automático com
 TotalSegmentator (`Process_DICOMFolder.sh`), cálculo do escore de Agatston e
-análise opcional de dose em `CAC.py`, e comparação 3D de RTSTRUCTs/DVH em
-`rt_dvh_app.py`.
+análise opcional de dose em `CAC.py`, e avaliação geométrica/dosimétrica de
+RTSTRUCTs em `avaliacao_auto_segmentacao_rt.py`.
 
 > **Atenção:** os resultados são auxiliares e não substituem a revisão das
 > imagens e estruturas por profissionais qualificados. Não use os resultados
@@ -55,7 +55,7 @@ py -3.12 -m venv .venv-cac
 
 O `reportlab` e o `pillow` habilitam a exportação de relatórios PDF com imagens.
 Sem eles, o cálculo pode ser usado, mas a exportação PDF não estará disponível.
-Para executar `rt_dvh_app.py` no Windows, use o procedimento da seção 7.1.
+Para executar `avaliacao_auto_segmentacao_rt.py` no Windows, use o procedimento da seção 7.1.
 
 ## 2. O que cada ferramenta faz
 
@@ -63,7 +63,7 @@ Para executar `rt_dvh_app.py` no Windows, use o procedimento da seção 7.1.
 |---|---|---|
 | `Process_DICOMFolder.sh` | Executa as segmentações MAMA, META ou PELVE e consolida RTSTRUCTs. | Ubuntu ou WSL |
 | `CAC.py` | Calcula escore de Agatston em ROIs cardíacas e, opcionalmente, métricas de RTDOSE. | Windows, Ubuntu ou WSL com interface gráfica |
-| `rt_dvh_app.py` | Compara RTSTRUCTs em 3D e calcula histogramas dose-volume (DVH). | Windows, Ubuntu ou WSL com interface gráfica |
+| `avaliacao_auto_segmentacao_rt.py` | Avalia contornos auto/médicos por geometria e dose, exibe comparação 3D e DVHs. | Windows, Ubuntu ou WSL com interface gráfica |
 
 As ferramentas têm dependências e entradas diferentes. Instale somente o que
 for usar, mas não misture arquivos de pacientes, aquisições ou referências
@@ -80,7 +80,7 @@ cd Codigos_AutoSegmentacao
 ```
 
 Se o repositório já estiver no computador, apenas abra o terminal na pasta que
-contém `Process_DICOMFolder.sh`, `CAC.py` e `rt_dvh_app.py`. No Windows, abra o
+contém `Process_DICOMFolder.sh`, `CAC.py` e `avaliacao_auto_segmentacao_rt.py`. No Windows, abra o
 Ubuntu/WSL para executar os scripts Bash; a unidade `C:` costuma estar
 disponível no WSL em `/mnt/c/`, e outras unidades aparecem sob `/mnt/` conforme
 a configuração local.
@@ -513,14 +513,15 @@ A exportação de PDF inclui a tabela, a explicação dos fatores do escore e,
 para estruturas com escore maior que zero, recortes CT com calcificações
 destacadas. Instale `reportlab` e `pillow` para habilitar a criação de PDF.
 
-## 7. Comparação 3D e DVH com `rt_dvh_app.py`
+## 7. Avaliação geométrica, 3D e dosimétrica com `avaliacao_auto_segmentacao_rt.py`
 
-O visualizador compara estruturas de RTSTRUCTs e calcula histogramas
-dose-volume. Instale as dependências listadas no repositório:
+O aplicativo compara estruturas auto-segmentadas e contornos de referência
+médica, calcula métricas geométricas e dose-volume e exibe uma comparação 3D.
+Instale as dependências listadas no repositório:
 
 ```bash
 python3 -m pip install -r requirements-dvh.txt
-python3 rt_dvh_app.py
+python3 avaliacao_auto_segmentacao_rt.py
 ```
 
 Use Python 3.10 ou superior. A instalação feita na seção 1 já inclui essas
@@ -533,7 +534,7 @@ No Windows, crie um ambiente virtual próprio no PowerShell e execute:
 py -3.12 -m venv .venv-dvh
 & ".\.venv-dvh\Scripts\python.exe" -m pip install --upgrade pip
 & ".\.venv-dvh\Scripts\python.exe" -m pip install -r requirements-dvh.txt
-& ".\.venv-dvh\Scripts\python.exe" rt_dvh_app.py
+& ".\.venv-dvh\Scripts\python.exe" avaliacao_auto_segmentacao_rt.py
 ```
 
 ### 7.1. Preparar a análise
@@ -542,12 +543,14 @@ py -3.12 -m venv .venv-dvh
    RTSTRUCTs. Se estiverem em pastas diferentes, use os botões de seleção
    manual para a dose e para cada RTSTRUCT.
 2. Selecione explicitamente a CT, o RTDOSE, o RTSTRUCT de auto-segmentação e
-   o RTSTRUCT dos PTVs. Arquivos com prefixo `TOTAL_` podem ser sugeridos para
-   auto-segmentação; arquivos válidos começando com `SS` podem ser sugeridos
-   para PTVs.
-3. Confira a lista de ROIs. As ROIs com `PTV` no nome são pré-selecionadas
-   quando encontradas. Se nenhuma for selecionada automaticamente, marque
-   manualmente as estruturas corretas.
+   o RTSTRUCT de referência médica. Arquivos RTDOSE cujo nome começa com
+   `DOSE` e RTSTRUCTs cujo nome começa com `SS` são selecionados
+   automaticamente quando encontrados; arquivos com prefixo `TOTAL_` podem
+   ser sugeridos para auto-segmentação.
+3. Confira as listas de ROIs e selecione estruturas correspondentes nos dois
+   RTSTRUCTs. ROIs com `PTV` no nome são pré-selecionadas na referência,
+   quando encontradas. Informe a dose de prescrição em Gy; ela é obrigatória
+   para calcular o DVH e as métricas.
 4. Clique em **Iniciar análise 3D**. Aguarde o processamento das superfícies;
    a janela 3D aparece quando essa etapa terminar.
 5. Avalie a sugestão de ROIs automáticas com pelo menos 60% do volume dentro
@@ -558,23 +561,49 @@ py -3.12 -m venv .venv-dvh
 
 - A visualização 3D mostra auto-segmentação, comparação e PTVs. Na comparação,
   verde claro é a interseção, verde escuro é a parte da auto-segmentação fora
-  dos PTVs e laranja é a parte dos PTVs fora da auto-segmentação. A rotação é
-  sincronizada entre as vistas.
-- **Tabela de métricas** informa quanto de cada ROI automática está dentro
-  dos PTVs, o Dice entre cada máscara e a união dos PTVs, e a cobertura dos
-  PTVs por expansões de 0,5 cm e 1 cm das ROIs automáticas. As margens são
-  aplicadas às estruturas automáticas, não aos PTVs.
-- **Calcular DVH** mostra curvas de volume percentual e absoluto (cm³) para
-  cada ROI automática marcada, a união dessas ROIs, as expansões de 0,5 cm e
-  1 cm e a união dos PTVs identificada como **PTV Original**. O passo de dose
-  é 0,1 Gy.
-- As margens são limitadas à ROI `patient` erodida em 0,5 cm. Se ela não
-  existir, o programa permite escolher uma estrutura substituta, que também
-  será erodida. As estruturas individuais e a união sem margem não são
-  recortadas por esse limite.
-- Use a opção de salvar CSV para exportar os dados (separador `;` e vírgula
-  decimal) e **Salvar gráficos DVH (2 PNG)** para salvar os gráficos percentual
-  e absoluto separadamente.
+  da referência e amarelo semitransparente (50%) é a parte da referência fora
+  da auto-segmentação. A rotação é sincronizada entre as vistas; use a roda do
+  mouse sobre qualquer vista para aproximar ou afastar as estruturas.
+- **Métricas por estrutura** mostra, em três linhas por ROI automática
+  (original, +0,5 cm e +1,0 cm), o percentual dentro da referência, o volume e
+  a razão dos parâmetros dosimétricos em relação ao PTV médico original:
+  dose média, dose máxima, D98/D95/D50/D2 e Vprescrição. Uma razão 1,000
+  indica valor igual ao PTV; valores abaixo ou acima indicam, respectivamente,
+  valores menores ou maiores. Essa tabela não reporta Dice, Hausdorff,
+  distância média de superfície nem volumes/diferença volumétrica auto versus
+  médico.
+- **Calcular DVH** calcula somente quatro curvas: PTV original, união das
+  estruturas automáticas e essa união expandida em 0,5 e 1,0 cm. O botão
+  **Mostrar subestruturas**, dentro da janela DVH, permite selecionar contornos
+  automáticos e médicos individuais para sobrepor às curvas principais.
+- Os botões de exportar CSV e salvar os dois gráficos ficam dentro da janela
+  DVH e exportam as curvas atualmente exibidas. O CSV começa com a coluna
+  `PatientID`.
+- A janela 3D tem um botão para salvar a figura completa da comparação em PNG.
+- **Resumo dosimétrico** abre uma tabela integrada, com o `PatientID` extraído
+  da CT na primeira coluna. Ela reúne volume, dose média/máxima, D98, D95,
+  D50, D2 e Vprescrição, além de Dice, Hausdorff, distância média de
+  superfície, volumes auto/médico e diferença volumétrica. As expansões
+  automáticas são comparadas com a referência médica original, sem expandir
+  essa referência.
+- **Métricas por estrutura** apresenta, para cada estrutura automática,
+  percentual dentro da referência, volume e razões dos parâmetros de dose
+  relativos ao PTV médico original. A referência (PTV) permanece sem expansão.
+  Os valores numéricos dessa tabela usam vírgula decimal. O `PatientID` é a
+  primeira coluna. A tabela permite salvar CSV, copiar com cabeçalho pelo
+  botão **Copiar** ou copiar sem cabeçalho; os textos explicativos ficam
+  disponíveis pelo botão **?**.
+- Ao descobrir os arquivos e antes das análises, o aplicativo compara o
+  `PatientID` da CT, RTDOSE e RTSTRUCTs selecionados. IDs diferentes ou
+  ausentes são informados no console, identificando o arquivo e o ID; IDs
+  iguais não geram mensagem. Os nomes sugeridos para arquivos salvos começam
+  com o ID do paciente e um sublinhado.
+- Para o DVH da união, as expansões são limitadas à ROI `patient` erodida em
+  0,5 cm. Se ela não existir, o programa permite escolher uma estrutura
+  substituta, que também será erodida. As análises por estrutura não expandem
+  nem recortam a referência PTV.
+- A barra de status e o indicador percentual mostram o progresso do
+  processamento.
 
 Frame of Reference ou referências de imagem ausentes/diferentes podem gerar
 avisos; o programa pode tentar a associação pelas coordenadas físicas, mas

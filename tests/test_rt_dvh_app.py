@@ -19,7 +19,7 @@ from pydicom.uid import (
     generate_uid,
 )
 
-import rt_dvh_app as app
+import avaliacao_auto_segmentacao_rt as app
 
 
 def _new_file(path, sop_class, modality):
@@ -44,6 +44,15 @@ class DvhBackendTests(unittest.TestCase):
         ]
 
         self.assertEqual(app.choose_default_rtstructs(files), (1, 2))
+        self.assertEqual(
+            app.preferred_dose_index(
+                [
+                    app.DicomFile(Path("plan.dcm"), "", ""),
+                    app.DicomFile(Path("DOSE_primary.dcm"), "", ""),
+                ]
+            ),
+            1,
+        )
         self.assertEqual(
             app.preferred_ptv_indices(["Body", "ptv_boost", "PTV"]), [1, 2]
         )
@@ -150,6 +159,40 @@ class DvhBackendTests(unittest.TestCase):
             far_metrics["ptv_inside_auto_margin_10_percent"], 60.0
         )
 
+    def test_contour_metrics_compare_original_and_expanded_auto_manual_masks(self):
+        class Series:
+            row_spacing = 2.0
+            column_spacing = 1.0
+            slice_spacing = 1.0
+
+        auto = np.zeros((12, 12, 12), dtype=bool)
+        manual = np.zeros_like(auto)
+        auto[3:7, 3:7, 3:7] = True
+        manual[4:8, 3:7, 3:7] = True
+
+        rows = app.contour_comparison_metrics(
+            {"ROI": auto}, {"ROI": manual}, Series()
+        )
+
+        self.assertEqual(len(rows), 9)
+        paired = next(
+            row for row in rows
+            if row["structure"] == "Par correspondente: ROI"
+            and row["margin_mm"] == 0
+        )
+        self.assertAlmostEqual(paired["dice_percent"], 75.0)
+        self.assertAlmostEqual(paired["hausdorff_mm"], 2.0)
+        self.assertGreater(paired["mean_surface_distance_mm"], 0.0)
+        manual_volumes = {
+            row["manual_volume_cc"]
+            for row in rows
+            if row["structure"] == "Par correspondente: ROI"
+        }
+        self.assertEqual(len(manual_volumes), 1)
+        self.assertEqual(
+            {row["margin_mm"] for row in rows}, {0.0, 5.0, 10.0}
+        )
+
     def test_containment_failure_message_reports_best_overlap(self):
         message = app.containment_failure_message(
             {"Cervical": 0.4, "Thoracic": 0.0}
@@ -223,7 +266,7 @@ class DvhBackendTests(unittest.TestCase):
 
             with warnings.catch_warnings(record=True) as captured:
                 warnings.simplefilter("always")
-                with self.assertLogs("rt_dvh_app", level="INFO"):
+                with self.assertLogs("avaliacao_auto_segmentacao_rt", level="INFO"):
                     result = app.read_dicom(path)
 
         self.assertEqual(result.file_meta.TransferSyntaxUID, ImplicitVRLittleEndian)
@@ -292,7 +335,7 @@ class DvhBackendTests(unittest.TestCase):
             )
 
         load_grid.assert_called_once_with(Path("dose.dcm"))
-        self.assertEqual(sample.call_count, 5)
+        self.assertEqual(sample.call_count, 4)
         self.assertTrue(all(call.kwargs["dose_grid"] is grid for call in sample.call_args_list))
 
     def test_external_dose_picker_validation_is_independent_of_folder(self):
@@ -386,6 +429,43 @@ class DvhBackendTests(unittest.TestCase):
         self.assertTrue(expanded[3, 5, 3])
         self.assertFalse(expanded[3, 6, 3])
 
+    def test_dvh_curve_reports_dose_metrics_and_prescription_coverage(self):
+        curve = app.create_dvh_curve(
+            "PTV", np.array([1.0, 2.0, 3.0, 4.0]), 0.25, 3.0
+        )
+
+        self.assertEqual(curve.mean_dose_gy, 2.5)
+        self.assertEqual(curve.max_dose_gy, 4.0)
+        self.assertAlmostEqual(curve.d95_gy, 1.15)
+        self.assertEqual(curve.coverage_percent, 50.0)
+
+    def test_dosimetric_comparison_reports_union_and_margin_differences(self):
+        auto = app.create_dvh_curve(
+            "Auto-segmentação — união", np.array([2.0, 4.0]), 0.1, 3.0
+        )
+        manual = app.create_dvh_curve(
+            "PTV Original", np.array([1.0, 3.0]), 0.1, 3.0
+        )
+        auto_margin = app.create_dvh_curve(
+            "Auto-segmentação — margem 0,5 cm", np.array([2.0, 4.0]), 0.1, 3.0
+        )
+        manual_margin = app.create_dvh_curve(
+            "Referência médica — margem 0,5 cm",
+            np.array([1.0, 3.0]),
+            0.1,
+            3.0,
+        )
+
+        rows = app.dosimetric_comparison_rows(
+            [auto, manual, auto_margin, manual_margin]
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["comparison"], "União original")
+        self.assertEqual(rows[0]["mean_dose_difference_gy"], 1.0)
+        self.assertEqual(rows[0]["coverage_difference_percent"], 0.0)
+        self.assertEqual(rows[1]["comparison"], "União + margem 0,5 cm")
+
     def test_margin_crop_matches_full_volume_distance_transform(self):
         from scipy.ndimage import distance_transform_edt
 
@@ -425,7 +505,7 @@ class DvhBackendTests(unittest.TestCase):
         self.assertTrue(eroded[7, 7, 7])
         self.assertTrue(eroded.any())
 
-    def test_dvh_individualizes_auto_rois_and_clips_both_margins(self):
+    def test_dvh_calculates_only_ptv_auto_union_and_union_margins(self):
         class Series:
             row_spacing = 1.0
             column_spacing = 1.0
@@ -467,18 +547,254 @@ class DvhBackendTests(unittest.TestCase):
         self.assertEqual(
             [curve.name for curve in curves],
             [
-                "Auto-segmentação — Lung_L",
-                "Auto-segmentação — Heart",
+                "PTV Original",
                 "Auto-segmentação — união",
                 "Auto-segmentação — margem 0,5 cm",
                 "Auto-segmentação — margem 1 cm",
-                "PTV Original",
             ],
         )
+        np.testing.assert_array_equal(captured_masks[2], safe_volume)
         np.testing.assert_array_equal(captured_masks[3], safe_volume)
-        np.testing.assert_array_equal(captured_masks[4], safe_volume)
-        np.testing.assert_array_equal(captured_masks[0], left_masks["Lung_L"])
-        np.testing.assert_array_equal(captured_masks[5], patient)
+        np.testing.assert_array_equal(captured_masks[0], patient)
+        self.assertFalse(any(np.array_equal(mask, left_masks["Heart"]) for mask in captured_masks))
+
+    def test_summary_geometry_expands_only_auto_union(self):
+        class Series:
+            row_spacing = 1.0
+            column_spacing = 1.0
+            slice_spacing = 1.0
+
+        auto = np.zeros((25, 25, 25), dtype=bool)
+        manual = np.zeros_like(auto)
+        auto[12, 12, 12] = True
+        manual[12, 12, 12] = True
+
+        rows = app.summary_geometry_metrics(
+            {"ROI": auto}, {"PTV": manual}, Series()
+        )
+
+        self.assertEqual([row["margin_mm"] for row in rows], [0.0, 5.0, 10.0])
+        self.assertTrue(all(row["manual_volume_cc"] == 0.001 for row in rows))
+        self.assertGreater(rows[1]["auto_volume_cc"], rows[0]["auto_volume_cc"])
+        self.assertGreater(rows[2]["auto_volume_cc"], rows[1]["auto_volume_cc"])
+
+    def test_patient_id_is_read_from_ct_series(self):
+        series = app.CTSeries(
+            datasets=[SimpleNamespace(PatientID="PSEUDO-123")],
+            paths=[],
+            row_spacing=1.0,
+            column_spacing=1.0,
+            slice_spacing=1.0,
+            row_direction=np.ones(3),
+            column_direction=np.ones(3),
+        )
+
+        self.assertEqual(app.patient_id_from_ct_series(series), "PSEUDO-123")
+
+    def test_patient_id_mismatches_are_reported_but_matching_ids_are_silent(self):
+        matching = [
+            ("CT", app.DicomFile(Path("ct.dcm"), "", "", patient_id="P1")),
+            ("RTDOSE", app.DicomFile(Path("dose.dcm"), "", "", patient_id="P1")),
+        ]
+        mismatching = [
+            *matching,
+            ("RTSTRUCT", app.DicomFile(Path("ss.dcm"), "", "", patient_id="P2")),
+        ]
+
+        with patch("builtins.print") as print_mock:
+            self.assertFalse(app.report_dicom_patient_id_mismatches(matching))
+        print_mock.assert_not_called()
+
+        with patch("builtins.print") as print_mock:
+            self.assertTrue(app.report_dicom_patient_id_mismatches(mismatching))
+        output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn("ct.dcm: P1", output)
+        self.assertIn("dose.dcm: P1", output)
+        self.assertIn("ss.dcm: P2", output)
+
+    def test_saved_output_names_are_prefixed_with_patient_id(self):
+        self.assertEqual(
+            app.patient_output_filename("P123", "resumo", "csv"),
+            "P123_resumo.csv",
+        )
+        self.assertEqual(
+            app.ensure_patient_output_prefix(Path("resumo.csv"), "P123"),
+            Path("P123_resumo.csv"),
+        )
+        self.assertEqual(
+            app.ensure_patient_output_prefix(Path("P123_resumo.csv"), "P123"),
+            Path("P123_resumo.csv"),
+        )
+        self.assertEqual(
+            app.patient_output_filename("ID indisponível", "dvh", "csv"),
+            "ID_indisponivel_dvh.csv",
+        )
+
+    def test_structure_evaluation_rows_report_dose_ratios_for_all_margins(self):
+        series = app.CTSeries(
+            datasets=[SimpleNamespace(PatientID="P123")],
+            paths=[],
+            row_spacing=1.0,
+            column_spacing=1.0,
+            slice_spacing=1.0,
+            row_direction=np.array([1.0, 0.0, 0.0]),
+            column_direction=np.array([0.0, 1.0, 0.0]),
+        )
+        auto = np.zeros((25, 25, 25), dtype=bool)
+        reference = np.zeros_like(auto)
+        auto[12, 12, 12] = True
+        reference[12, 12, 12] = True
+
+        with patch.object(
+            app, "sample_dose_on_mask", return_value=(np.array([60.0, 70.0]), 0.001)
+        ):
+            rows = app.structure_evaluation_rows(
+                {"Coluna": auto},
+                reference,
+                series,
+                dose_grid=object(),
+                reference_dose_curve=app.create_dvh_curve(
+                    "PTV médico original",
+                    np.array([50.0, 60.0]),
+                    0.001,
+                    prescription_dose_gy=60.0,
+                ),
+                prescription_dose_gy=60.0,
+            )
+
+        self.assertEqual([row["structure"] for row in rows], [
+            "Coluna", "Coluna + 0.5 cm", "Coluna + 1.0 cm"
+        ])
+        self.assertTrue(all(row["patient_id"] == "P123" for row in rows))
+        self.assertEqual([row["margin_mm"] for row in rows], [0.0, 5.0, 10.0])
+        self.assertTrue(all(row["inside_reference_percent"] <= 100 for row in rows))
+        self.assertTrue(
+            all(np.isclose(row["mean_dose_ratio"], 65.0 / 55.0) for row in rows)
+        )
+        self.assertTrue(
+            all(np.isclose(row["max_dose_ratio"], 70.0 / 60.0) for row in rows)
+        )
+        self.assertTrue(all(row["coverage_ratio"] == 2.0 for row in rows))
+        for row in rows:
+            self.assertNotIn("dice_percent", row)
+            self.assertNotIn("hausdorff_mm", row)
+            self.assertNotIn("mean_surface_distance_mm", row)
+            self.assertNotIn("auto_volume_cc", row)
+            self.assertNotIn("manual_volume_cc", row)
+            self.assertNotIn("volume_difference_percent", row)
+
+    def test_brazilian_number_format_and_required_prescription(self):
+        self.assertEqual(app.format_brazilian_number(2.3, 1), "2,3")
+        self.assertEqual(app.format_brazilian_number(1.0, 3), "1,000")
+        self.assertEqual(app.parse_prescription_dose("60,5"), 60.5)
+        with self.assertRaisesRegex(ValueError, "Informe a dose"):
+            app.parse_prescription_dose("")
+        with self.assertRaisesRegex(ValueError, "positiva"):
+            app.parse_prescription_dose("0")
+
+    def test_copy_table_uses_main_clipboard_and_optionally_includes_header(self):
+        class ClipboardRoot:
+            copied = ""
+
+            def clipboard_clear(self):
+                self.copied = ""
+
+            def clipboard_append(self, text):
+                self.copied = text
+
+            def update(self):
+                pass
+
+        root = ClipboardRoot()
+        application = app.DvhApplication.__new__(app.DvhApplication)
+        application.root = root
+        window = object()
+        with (
+            patch.object(app.DvhApplication, "_table_rows", return_value=[["P1", "1,2"]]),
+            patch.object(
+                app.DvhApplication,
+                "_table_headers",
+                return_value=["ID do paciente", "Dose média / PTV"],
+            ),
+            patch.object(app.messagebox, "showinfo"),
+        ):
+            application._copy_table_to_clipboard(window, None, True)
+
+        self.assertEqual(
+            root.copied,
+            "ID do paciente\tDose média / PTV\r\nP1\t1,2",
+        )
+        with (
+            patch.object(app.DvhApplication, "_table_rows", return_value=[["P1", "1,2"]]),
+            patch.object(app.messagebox, "showinfo"),
+        ):
+            application._copy_table_to_clipboard(window, None, False)
+        self.assertEqual(root.copied, "P1\t1,2")
+
+    def test_3d_wheel_zoom_changes_limits_for_all_views(self):
+        class Axes:
+            def __init__(self):
+                self.limits = [(-5.0, 5.0), (-5.0, 5.0), (-5.0, 5.0)]
+
+            def get_xlim3d(self):
+                return self.limits[0]
+
+            def get_ylim3d(self):
+                return self.limits[1]
+
+            def get_zlim3d(self):
+                return self.limits[2]
+
+            def set_xlim3d(self, lower, upper):
+                self.limits[0] = (lower, upper)
+
+            def set_ylim3d(self, lower, upper):
+                self.limits[1] = (lower, upper)
+
+            def set_zlim3d(self, lower, upper):
+                self.limits[2] = (lower, upper)
+
+        class Canvas:
+            draw_calls = 0
+
+            def draw_idle(self):
+                self.draw_calls += 1
+
+        axes = (Axes(), Axes(), Axes())
+        application = app.DvhApplication.__new__(app.DvhApplication)
+        application.ax_left_3d, application.ax_right_3d, application.ax_comparison_3d = axes
+        application.three_d_canvas = Canvas()
+
+        application._zoom_3d(SimpleNamespace(inaxes=axes[1], button="up"))
+
+        self.assertEqual(axes[0].get_xlim3d(), (-4.0, 4.0))
+        self.assertEqual(axes[1].get_ylim3d(), (-4.0, 4.0))
+        self.assertEqual(axes[2].get_zlim3d(), (-4.0, 4.0))
+        self.assertEqual(application.three_d_canvas.draw_calls, 1)
+
+    def test_yellow_3d_difference_surface_has_half_transparency(self):
+        figure = app.Figure()
+        left_axes = figure.add_subplot(1, 3, 1, projection="3d")
+        comparison_axes = figure.add_subplot(1, 3, 2, projection="3d")
+        right_axes = figure.add_subplot(1, 3, 3, projection="3d")
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=float)
+        surface = (vertices, np.array([[0, 1, 2]], dtype=np.int32))
+
+        app.draw_structure_3d(
+            left_axes,
+            right_axes,
+            None,
+            None,
+            None,
+            prepared_surfaces=(surface, surface),
+            comparison_axes=comparison_axes,
+            prepared_comparison_surfaces=(surface, surface, surface),
+        )
+        figure.canvas.draw()
+
+        self.assertAlmostEqual(
+            comparison_axes.collections[-1].get_facecolor()[0][3], 0.5
+        )
 
     def test_dvh_hover_cursor_shows_dose_and_updates_legend_volumes(self):
         figure = app.Figure()
@@ -699,7 +1015,7 @@ class DvhBackendTests(unittest.TestCase):
             structure.save_as(structure_path, enforce_file_format=True)
 
             ct_series = app.load_ct_series(folder, series_uid)
-            with self.assertLogs("rt_dvh_app", level="WARNING") as logged:
+            with self.assertLogs("avaliacao_auto_segmentacao_rt", level="WARNING") as logged:
                 masks = app.load_structure_masks(ct_series, structure_path, ["Auto"])
             structure = pydicom.dcmread(structure_path)
             del structure.ReferencedFrameOfReferenceSequence
@@ -867,11 +1183,14 @@ class DvhBackendTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "dvh.csv"
-            app.export_dvh_csv([curve], output)
+            app.export_dvh_csv([curve], output, patient_id="PSEUDO-123")
             lines = output.read_text(encoding="utf-8-sig").splitlines()
-        self.assertEqual(lines[0], "Estrutura;Dose (Gy);Volume (cm3);Volume (%)")
-        self.assertEqual(lines[1], "ROI;0,0000;2,000000;100,0000")
-        self.assertEqual(lines[2], "ROI;1,0000;0,500000;25,0000")
+        self.assertEqual(
+            lines[0],
+            "PatientID;Estrutura;Dose (Gy);Volume (cm3);Volume (%)",
+        )
+        self.assertEqual(lines[1], "PSEUDO-123;ROI;0,0000;2,000000;100,0000")
+        self.assertEqual(lines[2], "PSEUDO-123;ROI;1,0000;0,500000;25,0000")
 
     def test_export_does_not_add_dose_coverage_metadata(self):
         curve = app.DVHCurve(

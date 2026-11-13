@@ -1,4 +1,4 @@
-"""Desktop viewer for comparing RTSTRUCT contours and dose-volume histograms."""
+"""Desktop application for geometric and dosimetric RTSTRUCT evaluation."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import csv
 import logging
 import os
 import queue
+import re
 import struct
 import threading
 import tkinter as tk
@@ -35,8 +36,9 @@ from pydicom.uid import (
     RTDoseStorage,
     RTStructureSetStorage,
 )
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import binary_erosion, distance_transform_edt, map_coordinates
 from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes
 
 _VR_MISMATCH_WARNINGS = (
@@ -174,6 +176,8 @@ class DicomFile:
     description: str
     patient_name: str = ""
     instance_paths: tuple[Path, ...] = ()
+    patient_id: str = ""
+    patient_ids: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -207,10 +211,92 @@ class DVHCurve:
     dose_gy: np.ndarray
     volume_cc: np.ndarray
     volume_percent: np.ndarray
+    mean_dose_gy: float = float("nan")
+    max_dose_gy: float = float("nan")
+    d98_gy: float = float("nan")
+    d95_gy: float = float("nan")
+    d50_gy: float = float("nan")
+    d2_gy: float = float("nan")
+    coverage_percent: float | None = None
 
 
 def _sop_class(dataset) -> str:
     return str(getattr(dataset, "SOPClassUID", ""))
+
+
+def patient_id_from_ct_series(ct_series: CTSeries) -> str:
+    if not ct_series.datasets:
+        return "ID indisponível"
+    patient_id = str(getattr(ct_series.datasets[0], "PatientID", "")).strip()
+    return patient_id or "ID indisponível"
+
+
+def dicom_patient_id_mismatches(
+    named_files: list[tuple[str, DicomFile]],
+) -> list[tuple[str, str]]:
+    entries = []
+    for label, item in named_files:
+        identifiers = item.patient_ids or (item.patient_id,)
+        entries.extend(
+            (f"{label}: {item.path.name}", patient_id.strip())
+            for patient_id in identifiers
+        )
+    known_ids = {patient_id for _label, patient_id in entries if patient_id}
+    has_missing_ids = any(not patient_id for _label, patient_id in entries)
+    if len(known_ids) <= 1 and not (known_ids and has_missing_ids):
+        return []
+    return entries
+
+
+def report_dicom_patient_id_mismatches(
+    named_files: list[tuple[str, DicomFile]],
+) -> bool:
+    entries = dicom_patient_id_mismatches(named_files)
+    if not entries:
+        return False
+    print("PatientID divergente ou ausente entre os conjuntos DICOM selecionados:")
+    for label, patient_id in entries:
+        print(f"  {label}: {patient_id or 'ausente'}")
+    return True
+
+
+def patient_output_filename(patient_id: str, label: str, extension: str) -> str:
+    safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", patient_id.strip())
+    safe_label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label.strip())
+    if safe_id.casefold() in {"", "id indisponível", "id indisponivel"}:
+        safe_id = "ID_indisponivel"
+    return f"{safe_id or 'ID_indisponivel'}_{safe_label}.{extension.lstrip('.')}"
+
+
+def ensure_patient_output_prefix(path: str | Path, patient_id: str) -> Path:
+    output = Path(path)
+    safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", patient_id.strip())
+    if safe_id.casefold() in {"", "id indisponível", "id indisponivel"}:
+        safe_id = "ID_indisponivel"
+    prefix = f"{safe_id or 'ID_indisponivel'}_"
+    if not output.name.casefold().startswith(prefix.casefold()):
+        output = output.with_name(prefix + output.name)
+    return output
+
+
+def export_table_csv(
+    headers: list[str], rows: list[list[object]], output_path: str | Path
+) -> None:
+    with Path(output_path).open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream, delimiter=";", lineterminator="\n")
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def help_button(
+    parent: tk.Misc, title: str, explanation: str
+) -> ttk.Button:
+    return ttk.Button(
+        parent,
+        text="?",
+        width=3,
+        command=lambda: messagebox.showinfo(title, explanation, parent=parent),
+    )
 
 
 def _iter_dicom_candidates(root: Path):
@@ -251,7 +337,7 @@ def discover_dicom_files(
     if not root.is_dir():
         raise ValueError(f"A pasta não existe: {root}")
 
-    ct_groups: dict[str, list[tuple[Path, str, str]]] = {}
+    ct_groups: dict[str, list[tuple[Path, str, str, str]]] = {}
     doses: list[DicomFile] = []
     structures: list[DicomFile] = []
     if progress:
@@ -275,14 +361,31 @@ def discover_dicom_files(
             uid = str(getattr(dataset, "SeriesInstanceUID", ""))
             if uid:
                 patient_name = str(getattr(dataset, "PatientName", "")).strip()
-                ct_groups.setdefault(uid, []).append((path, description, patient_name))
+                patient_id = str(getattr(dataset, "PatientID", "")).strip()
+                ct_groups.setdefault(uid, []).append(
+                    (path, description, patient_name, patient_id)
+                )
         elif sop == str(RTDoseStorage) or modality == "RTDOSE":
+            patient_id = str(getattr(dataset, "PatientID", "")).strip()
             doses.append(
-                DicomFile(path, str(getattr(dataset, "SeriesInstanceUID", "")), description)
+                DicomFile(
+                    path,
+                    str(getattr(dataset, "SeriesInstanceUID", "")),
+                    description,
+                    patient_id=patient_id,
+                    patient_ids=(patient_id,),
+                )
             )
         elif sop == str(RTStructureSetStorage) or modality == "RTSTRUCT":
+            patient_id = str(getattr(dataset, "PatientID", "")).strip()
             structures.append(
-                DicomFile(path, str(getattr(dataset, "SeriesInstanceUID", "")), description)
+                DicomFile(
+                    path,
+                    str(getattr(dataset, "SeriesInstanceUID", "")),
+                    description,
+                    patient_id=patient_id,
+                    patient_ids=(patient_id,),
+                )
             )
 
     ct_series = [
@@ -292,6 +395,8 @@ def discover_dicom_files(
             paths[0][1] or f"CT ({len(paths)} cortes)",
             paths[0][2],
             tuple(item[0] for item in paths),
+            paths[0][3],
+            tuple(sorted({item[3] for item in paths})),
         )
         for uid, paths in sorted(ct_groups.items())
     ]
@@ -301,7 +406,15 @@ def discover_dicom_files(
             item.path.name.casefold(),
         )
     )
-    return ct_series, sorted(doses, key=lambda item: item.path.name.casefold()), structures
+    doses = sorted(doses, key=lambda item: item.path.name.casefold())
+    report_dicom_patient_id_mismatches(
+        [
+            *((f"CT {item.series_uid[-8:]}", item) for item in ct_series),
+            *((f"RTDOSE {index + 1}", item) for index, item in enumerate(doses)),
+            *((f"RTSTRUCT {index + 1}", item) for index, item in enumerate(structures)),
+        ]
+    )
+    return ct_series, doses, structures
 
 
 def load_ct_series(
@@ -626,6 +739,17 @@ def choose_default_rtstructs(files: list[DicomFile]) -> tuple[int, int]:
     return auto_index, ptv_index
 
 
+def preferred_dose_index(files: list[DicomFile]) -> int:
+    return next(
+        (
+            index
+            for index, item in enumerate(files)
+            if item.path.name.casefold().startswith("dose")
+        ),
+        0,
+    )
+
+
 def preferred_ptv_indices(roi_names: list[str]) -> list[int]:
     return [index for index, name in enumerate(roi_names) if "ptv" in name.casefold()]
 
@@ -671,7 +795,7 @@ def structure_comparison_metrics(
     ct_series: CTSeries,
     progress=None,
 ) -> list[dict[str, float | str]]:
-    """Measure auto-ROI inclusion in the PTV and PTV coverage by auto-ROI margins."""
+    """Measure auto-ROI inclusion in the reference and reference coverage by margins."""
     ptv_mask = np.asarray(ptv_mask, dtype=bool)
     if any(np.asarray(mask).shape != ptv_mask.shape for mask in auto_masks.values()):
         raise ValueError("As máscaras das estruturas precisam ter a mesma grade.")
@@ -722,6 +846,243 @@ def structure_comparison_metrics(
     return rows
 
 
+def _mask_surface_distances(
+    left_mask: np.ndarray,
+    right_mask: np.ndarray,
+    sampling: tuple[float, float, float],
+) -> tuple[float, float]:
+    left_mask = np.asarray(left_mask, dtype=bool)
+    right_mask = np.asarray(right_mask, dtype=bool)
+    if left_mask.shape != right_mask.shape:
+        raise ValueError("As máscaras comparadas precisam ter a mesma grade.")
+    if not np.any(left_mask) or not np.any(right_mask):
+        return float("nan"), float("nan")
+
+    left_surface = np.argwhere(
+        left_mask & ~binary_erosion(left_mask, border_value=0)
+    ) * np.asarray(sampling)
+    right_surface = np.argwhere(
+        right_mask & ~binary_erosion(right_mask, border_value=0)
+    ) * np.asarray(sampling)
+    left_to_right = cKDTree(right_surface).query(left_surface)[0]
+    right_to_left = cKDTree(left_surface).query(right_surface)[0]
+    hausdorff = max(float(left_to_right.max()), float(right_to_left.max()))
+    mean_surface_distance = float(
+        (left_to_right.sum() + right_to_left.sum())
+        / (len(left_to_right) + len(right_to_left))
+    )
+    return hausdorff, mean_surface_distance
+
+
+def contour_comparison_metrics(
+    auto_masks: dict[str, np.ndarray],
+    manual_masks: dict[str, np.ndarray],
+    ct_series: CTSeries,
+) -> list[dict[str, float | str]]:
+    """Compare auto contours and 5/10 mm expansions with fixed medical contours."""
+    if not auto_masks or not manual_masks:
+        raise ValueError("Selecione estruturas automáticas e de referência médica.")
+    auto_arrays = [np.asarray(mask, dtype=bool) for mask in auto_masks.values()]
+    manual_arrays = [np.asarray(mask, dtype=bool) for mask in manual_masks.values()]
+    mask_shape = auto_arrays[0].shape
+    if any(mask.shape != mask_shape for mask in auto_arrays + manual_arrays):
+        raise ValueError("As máscaras comparadas precisam ter a mesma grade.")
+    auto_union = np.logical_or.reduce(auto_arrays)
+    manual_union = np.logical_or.reduce(manual_arrays)
+    if auto_union.ndim != 3:
+        raise ValueError("As máscaras comparadas precisam ser tridimensionais.")
+    if not np.any(auto_union) or not np.any(manual_union):
+        raise ValueError("As uniões automática e médica precisam conter voxels.")
+
+    sampling = (
+        ct_series.row_spacing,
+        ct_series.column_spacing,
+        ct_series.slice_spacing,
+    )
+    voxel_volume_cc = float(np.prod(sampling) / 1000.0)
+    comparisons = [
+        (f"{name} vs união médica", np.asarray(mask, dtype=bool), manual_union)
+        for name, mask in auto_masks.items()
+    ]
+    manual_names = {name.strip().casefold(): name for name in manual_masks}
+    for name, mask in auto_masks.items():
+        matching_name = manual_names.get(name.strip().casefold())
+        if matching_name is not None:
+            comparisons.append(
+                (
+                    f"Par correspondente: {name}",
+                    np.asarray(mask, dtype=bool),
+                    np.asarray(manual_masks[matching_name], dtype=bool),
+                )
+            )
+    comparisons.append(("União das estruturas", auto_union, manual_union))
+    rows = []
+    for name, auto_mask, reference_mask in comparisons:
+        if auto_mask.shape != reference_mask.shape:
+            raise ValueError("As máscaras comparadas precisam ter a mesma grade.")
+        for margin_mm in (0.0, 5.0, 10.0):
+            auto_volume = (
+                auto_mask
+                if margin_mm == 0
+                else margin_mask(auto_mask, ct_series, margin_mm)
+            )
+            manual_volume = reference_mask
+
+            auto_voxels = int(np.count_nonzero(auto_volume))
+            manual_voxels = int(np.count_nonzero(manual_volume))
+            intersection = int(np.count_nonzero(auto_volume & manual_volume))
+            denominator = auto_voxels + manual_voxels
+            dice = 2.0 * intersection / denominator * 100.0 if denominator else 100.0
+            hausdorff, mean_surface_distance = _mask_surface_distances(
+                auto_volume, manual_volume, sampling
+            )
+            volume_difference_percent = (
+                (auto_voxels - manual_voxels) / manual_voxels * 100.0
+                if manual_voxels
+                else float("nan")
+            )
+            rows.append(
+                {
+                    "structure": name,
+                    "margin_mm": margin_mm,
+                    "dice_percent": dice,
+                    "hausdorff_mm": hausdorff,
+                    "mean_surface_distance_mm": mean_surface_distance,
+                    "auto_volume_cc": auto_voxels * voxel_volume_cc,
+                    "manual_volume_cc": manual_voxels * voxel_volume_cc,
+                    "volume_difference_percent": volume_difference_percent,
+                }
+            )
+    return rows
+
+
+def summary_geometry_metrics(
+    auto_masks: dict[str, np.ndarray],
+    manual_masks: dict[str, np.ndarray],
+    ct_series: CTSeries,
+) -> list[dict[str, float | str]]:
+    """Compare the auto union and its margins with the unexpanded medical reference."""
+    if not auto_masks or not manual_masks:
+        raise ValueError("Selecione estruturas automáticas e de referência médica.")
+    mask_arrays = [
+        np.asarray(mask, dtype=bool)
+        for mask in (*auto_masks.values(), *manual_masks.values())
+    ]
+    shape = mask_arrays[0].shape
+    if len(shape) != 3 or any(mask.shape != shape for mask in mask_arrays):
+        raise ValueError("As máscaras comparadas precisam ter a mesma grade CT 3D.")
+    auto_union = np.logical_or.reduce(
+        mask_arrays[: len(auto_masks)]
+    )
+    manual_union = np.logical_or.reduce(
+        mask_arrays[len(auto_masks) :]
+    )
+    if not np.any(auto_union) or not np.any(manual_union):
+        raise ValueError("As uniões automática e médica precisam conter voxels.")
+    sampling = (
+        ct_series.row_spacing,
+        ct_series.column_spacing,
+        ct_series.slice_spacing,
+    )
+    voxel_volume_cc = float(np.prod(sampling) / 1000.0)
+    manual_voxels = int(np.count_nonzero(manual_union))
+    rows = []
+    for margin_mm in (0.0, 5.0, 10.0):
+        auto_volume = (
+            auto_union
+            if margin_mm == 0
+            else margin_mask(auto_union, ct_series, margin_mm)
+        )
+        auto_voxels = int(np.count_nonzero(auto_volume))
+        overlap = int(np.count_nonzero(auto_volume & manual_union))
+        denominator = auto_voxels + manual_voxels
+        hausdorff, mean_surface_distance = _mask_surface_distances(
+            auto_volume, manual_union, sampling
+        )
+        rows.append(
+            {
+                "margin_mm": margin_mm,
+                "dice_percent": (
+                    2.0 * overlap / denominator * 100.0 if denominator else 100.0
+                ),
+                "hausdorff_mm": hausdorff,
+                "mean_surface_distance_mm": mean_surface_distance,
+                "auto_volume_cc": auto_voxels * voxel_volume_cc,
+                "manual_volume_cc": manual_voxels * voxel_volume_cc,
+                "volume_difference_percent": (
+                    (auto_voxels - manual_voxels) / manual_voxels * 100.0
+                    if manual_voxels
+                    else float("nan")
+                ),
+            }
+        )
+    return rows
+
+
+def structure_evaluation_rows(
+    auto_masks: dict[str, np.ndarray],
+    reference_mask: np.ndarray,
+    ct_series: CTSeries,
+    dose_grid,
+    reference_dose_curve: DVHCurve,
+    prescription_dose_gy: float | None = None,
+) -> list[dict[str, float | str | None]]:
+    """Evaluate every auto contour and its 5/10 mm expansions against a fixed PTV."""
+    if not auto_masks:
+        raise ValueError("Selecione ao menos uma estrutura auto-segmentada.")
+    reference_mask = np.asarray(reference_mask, dtype=bool)
+    if reference_mask.ndim != 3 or not np.any(reference_mask):
+        raise ValueError("A referência médica (PTV) precisa conter voxels.")
+    sampling = (
+        ct_series.row_spacing,
+        ct_series.column_spacing,
+        ct_series.slice_spacing,
+    )
+    voxel_volume_cc = float(np.prod(sampling) / 1000.0)
+    rows = []
+    for name, mask in auto_masks.items():
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != reference_mask.shape:
+            raise ValueError("As máscaras comparadas precisam ter a mesma grade CT.")
+        for margin_mm in (0.0, 5.0, 10.0):
+            evaluated_mask = (
+                mask
+                if margin_mm == 0
+                else margin_mask(mask, ct_series, margin_mm)
+            )
+            voxels = int(np.count_nonzero(evaluated_mask))
+            if not voxels:
+                raise ValueError(
+                    f"A estrutura '{name}' ficou vazia após a expansão "
+                    f"de {margin_mm / 10:.1f} cm."
+                )
+            intersection = int(np.count_nonzero(evaluated_mask & reference_mask))
+            doses, sampled_voxel_volume_cc = sample_dose_on_mask(
+                evaluated_mask, ct_series, dose_grid=dose_grid
+            )
+            curve = create_dvh_curve(
+                name,
+                doses,
+                sampled_voxel_volume_cc,
+                prescription_dose_gy,
+            )
+            dose_ratios = dose_metric_ratios(curve, reference_dose_curve)
+            rows.append(
+                {
+                    "patient_id": patient_id_from_ct_series(ct_series),
+                    "structure": (
+                        name if margin_mm == 0 else
+                        f"{name} + {margin_mm / 10:.1f} cm"
+                    ),
+                    "margin_mm": margin_mm,
+                    "inside_reference_percent": intersection / voxels * 100.0,
+                    "volume_cc": voxels * voxel_volume_cc,
+                    **dose_ratios,
+                }
+            )
+    return rows
+
+
 def containment_failure_message(
     percentages: dict[str, float], threshold: float = 0.6
 ) -> str:
@@ -731,7 +1092,7 @@ def containment_failure_message(
     message = (
         f"Foram verificadas {len(percentages)} estrutura(s) da auto-segmentação. "
         f"Nenhuma alcançou o limite de {threshold:.0%}. "
-        "O percentual é a fração do volume de cada estrutura à esquerda que "
+        "O percentual é a fração do volume de cada estrutura automática que "
         "está dentro da união dos PTVs selecionados."
     )
     if not ranked:
@@ -812,6 +1173,8 @@ def inspect_dose_file(path: str | Path) -> DicomFile:
         Path(path),
         str(getattr(dataset, "SeriesInstanceUID", "")),
         str(getattr(dataset, "SeriesDescription", "")),
+        patient_id=str(getattr(dataset, "PatientID", "")).strip(),
+        patient_ids=(str(getattr(dataset, "PatientID", "")).strip(),),
     )
 
 
@@ -897,12 +1260,19 @@ def sample_dose_on_mask(
 
 
 def create_dvh_curve(
-    name: str, doses_gy: np.ndarray, voxel_volume_cc: float
+    name: str,
+    doses_gy: np.ndarray,
+    voxel_volume_cc: float,
+    prescription_dose_gy: float | None = None,
 ) -> DVHCurve:
     doses = np.asarray(doses_gy, dtype=float)
     doses = doses[np.isfinite(doses)]
     if not len(doses) or voxel_volume_cc <= 0:
         raise ValueError("Não há amostras de dose válidas para gerar o DVH.")
+    if prescription_dose_gy is not None and (
+        not np.isfinite(prescription_dose_gy) or prescription_dose_gy <= 0
+    ):
+        raise ValueError("A dose de prescrição deve ser um valor positivo em Gy.")
     max_dose = max(float(np.max(doses)), 0.0)
     bin_count = max(1, int(np.floor(np.nextafter(max_dose, np.inf) / 0.1)) + 1)
     edges = np.arange(bin_count + 1, dtype=float) * 0.1
@@ -910,7 +1280,73 @@ def create_dvh_curve(
     volume_cc = np.cumsum(histogram[::-1])[::-1].astype(float) * voxel_volume_cc
     total_volume = float(len(doses) * voxel_volume_cc)
     percent = volume_cc / total_volume * 100.0
-    return DVHCurve(name, edges[:-1], volume_cc, percent)
+    coverage = (
+        float(np.count_nonzero(doses >= prescription_dose_gy) / len(doses) * 100.0)
+        if prescription_dose_gy is not None
+        else None
+    )
+    return DVHCurve(
+        name,
+        edges[:-1],
+        volume_cc,
+        percent,
+        mean_dose_gy=float(np.mean(doses)),
+        max_dose_gy=float(np.max(doses)),
+        d98_gy=float(np.percentile(doses, 2)),
+        d95_gy=float(np.percentile(doses, 5)),
+        d50_gy=float(np.percentile(doses, 50)),
+        d2_gy=float(np.percentile(doses, 98)),
+        coverage_percent=coverage,
+    )
+
+
+def dose_metric_ratios(
+    curve: DVHCurve, reference_curve: DVHCurve
+) -> dict[str, float | None]:
+    metrics = {
+        "mean_dose_ratio": (curve.mean_dose_gy, reference_curve.mean_dose_gy),
+        "max_dose_ratio": (curve.max_dose_gy, reference_curve.max_dose_gy),
+        "d98_ratio": (curve.d98_gy, reference_curve.d98_gy),
+        "d95_ratio": (curve.d95_gy, reference_curve.d95_gy),
+        "d50_ratio": (curve.d50_gy, reference_curve.d50_gy),
+        "d2_ratio": (curve.d2_gy, reference_curve.d2_gy),
+        "coverage_ratio": (
+            curve.coverage_percent,
+            reference_curve.coverage_percent,
+        ),
+    }
+    ratios = {}
+    for name, (value, reference_value) in metrics.items():
+        if (
+            value is None
+            or reference_value is None
+            or not np.isfinite(value)
+            or not np.isfinite(reference_value)
+            or reference_value == 0
+        ):
+            ratios[name] = None
+        else:
+            ratios[name] = float(value / reference_value)
+    return ratios
+
+
+def format_brazilian_number(value: float | int, decimals: int = 2) -> str:
+    if not np.isfinite(value):
+        return "—"
+    return f"{value:.{decimals}f}".replace(".", ",")
+
+
+def parse_prescription_dose(value: str) -> float:
+    text = value.strip().replace(",", ".")
+    if not text:
+        raise ValueError("Informe a dose de prescrição em Gy.")
+    try:
+        dose = float(text)
+    except ValueError as error:
+        raise ValueError("A dose de prescrição deve ser numérica e estar em Gy.") from error
+    if not np.isfinite(dose) or dose <= 0:
+        raise ValueError("A dose de prescrição deve ser positiva e estar em Gy.")
+    return dose
 
 
 def margin_mask(mask: np.ndarray, ct_series: CTSeries, margin_mm: float) -> np.ndarray:
@@ -1020,7 +1456,7 @@ def draw_structure_3d(
             prepared_comparison_surfaces = prepare_comparison_surfaces(
                 left_mask, right_mask, ct_series
             )
-        comparison_colors = ("#176b3a", "#a8e6a3", "#e79a45")
+        comparison_colors = ("#176b3a", "#a8e6a3", "#ffeb3b")
         panels.append(
             (
                 comparison_axes,
@@ -1059,7 +1495,10 @@ def draw_structure_3d(
         light /= np.linalg.norm(light)
         illumination = 0.35 + 0.65 * np.maximum(normals @ light, 0.0)
         face_colors = np.column_stack(
-            (base_color[:3][None, :] * illumination[:, None], np.full(len(faces), 0.96))
+            (
+                base_color[:3][None, :] * illumination[:, None],
+                np.full(len(faces), 0.5 if color.casefold() == "#ffeb3b" else 0.96),
+            )
         )
         collection = Poly3DCollection(
             triangles,
@@ -1182,11 +1621,31 @@ def compute_dvh_curves(
     right_mask: np.ndarray,
     patient_mask: np.ndarray,
     progress=None,
+    manual_masks: dict[str, np.ndarray] | None = None,
+    prescription_dose_gy: float | None = None,
 ) -> tuple[list[DVHCurve], np.ndarray, np.ndarray]:
-    """Calculate DVHs for the union, expansions, and single physician ROI."""
+    """Calculate DVHs for the original target, auto union, and its expansions."""
     if not left_masks:
         raise ValueError("Selecione ao menos uma estrutura de auto-segmentação.")
-    combined = np.logical_or.reduce(list(left_masks.values()))
+    auto_arrays = [np.asarray(mask, dtype=bool) for mask in left_masks.values()]
+    mask_shape = auto_arrays[0].shape
+    if len(mask_shape) != 3 or any(
+        mask.shape != mask_shape for mask in auto_arrays
+    ):
+        raise ValueError("As máscaras automáticas precisam ter a mesma grade CT 3D.")
+    if manual_masks is None:
+        manual_masks = {"Referência": np.asarray(right_mask, dtype=bool)}
+    if not manual_masks:
+        raise ValueError("Selecione ao menos uma estrutura de referência médica.")
+    combined = np.logical_or.reduce(auto_arrays)
+    right_mask = np.asarray(right_mask, dtype=bool)
+    if (
+        combined.shape != patient_mask.shape
+        or combined.shape != right_mask.shape
+    ):
+        raise ValueError("As máscaras precisam ter a mesma grade CT.")
+    if not np.any(combined) or not np.any(right_mask):
+        raise ValueError("A união automática e o PTV precisam conter voxels.")
     if progress:
         progress(0, "Unindo estruturas, erodindo patient e calculando margens")
     eroded_patient = erode_mask(patient_mask, ct_series, 5.0)
@@ -1202,13 +1661,10 @@ def compute_dvh_curves(
     if progress:
         progress(16, "Margem de 1 cm concluída; carregando RTDOSE")
     masks = [
-        (f"Auto-segmentação — {name}", mask)
-        for name, mask in left_masks.items()
-    ] + [
+        ("PTV Original", right_mask),
         ("Auto-segmentação — união", combined),
         ("Auto-segmentação — margem 0,5 cm", margin_05),
         ("Auto-segmentação — margem 1 cm", margin_10),
-        ("PTV Original", right_mask),
     ]
     dose_grid = load_dose_grid(dose_path)
     if progress:
@@ -1222,7 +1678,9 @@ def compute_dvh_curves(
                 f"Interpolando dose e calculando DVH ({index}/{total_curves}): {name}",
             )
         doses, voxel_volume = sample_dose_on_mask(mask, ct_series, dose_grid=dose_grid)
-        curves.append(create_dvh_curve(name, doses, voxel_volume))
+        curves.append(
+            create_dvh_curve(name, doses, voxel_volume, prescription_dose_gy)
+        )
         if progress:
             progress(
                 20 + index * 80 / total_curves,
@@ -1231,13 +1689,77 @@ def compute_dvh_curves(
     return curves, combined, right_mask
 
 
+def dosimetric_comparison_rows(
+    curves: list[DVHCurve],
+) -> list[dict[str, float | str | None]]:
+    """Return auto-minus-reference dose differences for matched volume pairs."""
+    by_name = {curve.name: curve for curve in curves}
+    pairs = [
+        ("União original", "Auto-segmentação — união", "PTV Original"),
+        (
+            "União + margem 0,5 cm",
+            "Auto-segmentação — margem 0,5 cm",
+            "Referência médica — margem 0,5 cm",
+        ),
+        (
+            "União + margem 1,0 cm",
+            "Auto-segmentação — margem 1 cm",
+            "Referência médica — margem 1 cm",
+        ),
+    ]
+    for curve in curves:
+        prefix = "Auto-segmentação — "
+        if not curve.name.startswith(prefix):
+            continue
+        roi_name = curve.name[len(prefix):]
+        if roi_name in {"união", "margem 0,5 cm", "margem 1 cm"}:
+            continue
+        reference_name = f"Referência médica — {roi_name}"
+        if reference_name in by_name:
+            pairs.append((roi_name, curve.name, reference_name))
+    rows = []
+    for label, auto_name, manual_name in pairs:
+        auto = by_name.get(auto_name)
+        manual = by_name.get(manual_name)
+        if auto is None or manual is None:
+            continue
+        rows.append(
+            {
+                "comparison": label,
+                "auto_mean_dose_gy": auto.mean_dose_gy,
+                "manual_mean_dose_gy": manual.mean_dose_gy,
+                "mean_dose_difference_gy": auto.mean_dose_gy - manual.mean_dose_gy,
+                "auto_max_dose_gy": auto.max_dose_gy,
+                "manual_max_dose_gy": manual.max_dose_gy,
+                "max_dose_difference_gy": auto.max_dose_gy - manual.max_dose_gy,
+                "auto_d95_gy": auto.d95_gy,
+                "manual_d95_gy": manual.d95_gy,
+                "d95_difference_gy": auto.d95_gy - manual.d95_gy,
+                "auto_coverage_percent": auto.coverage_percent,
+                "manual_coverage_percent": manual.coverage_percent,
+                "coverage_difference_percent": (
+                    auto.coverage_percent - manual.coverage_percent
+                    if auto.coverage_percent is not None
+                    and manual.coverage_percent is not None
+                    else None
+                ),
+            }
+        )
+    return rows
+
+
 def export_dvh_csv(
-    curves: list[DVHCurve], output_path: str | Path, progress=None
+    curves: list[DVHCurve],
+    output_path: str | Path,
+    progress=None,
+    patient_id: str = "ID indisponível",
 ) -> None:
     """Write a Brazilian-locale CSV with dose, absolute volume, and percent."""
     with Path(output_path).open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream, delimiter=";", lineterminator="\n")
-        writer.writerow(("Estrutura", "Dose (Gy)", "Volume (cm3)", "Volume (%)"))
+        writer.writerow(
+            ("PatientID", "Estrutura", "Dose (Gy)", "Volume (cm3)", "Volume (%)")
+        )
         for index, curve in enumerate(curves, 1):
             rows = []
             for dose, volume, percent in zip(
@@ -1245,6 +1767,7 @@ def export_dvh_csv(
             ):
                 rows.append(
                     (
+                        patient_id,
                         curve.name,
                         f"{dose:.4f}".replace(".", ","),
                         f"{volume:.6f}".replace(".", ","),
@@ -1399,12 +1922,20 @@ class DvhApplication:
         self.rtstruct_files: list[DicomFile] = []
         self.ct_series: CTSeries | None = None
         self.curves: list[DVHCurve] = []
+        self.display_curves: list[DVHCurve] = []
+        self.summary_rows: list[dict[str, float | str]] = []
+        self.patient_id = "ID indisponível"
+        self._dvh_context: dict[str, object] | None = None
+        self._dvh_substructure_names: list[str] = []
+        self._substructure_checks: dict[tuple[str, str], tk.BooleanVar] = {}
+        self.dvh_toolbar: ttk.Frame | None = None
         self.three_d_window: tk.Toplevel | None = None
         self.three_d_figure: Figure | None = None
         self.three_d_canvas: FigureCanvasTkAgg | None = None
         self.ax_left_3d = None
         self.ax_right_3d = None
         self.ax_comparison_3d = None
+        self.three_d_toolbar: ttk.Frame | None = None
         self.dvh_window: tk.Toplevel | None = None
         self.dvh_figure: Figure | None = None
         self.dvh_canvas: FigureCanvasTkAgg | None = None
@@ -1426,6 +1957,7 @@ class DvhApplication:
         self._containment_cache: OrderedDict[
             tuple[str, str, str, tuple[str, ...]], dict[str, float]
         ] = OrderedDict()
+        self.prescription_dose_gy = tk.StringVar(value="")
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1443,27 +1975,44 @@ class DvhApplication:
         self.ct_combo.bind("<<ComboboxSelected>>", lambda _event: self._ct_selection_changed())
         ttk.Label(controls, text="Dose RTDOSE:").grid(row=1, column=2, sticky="e", padx=4)
         self.dose_combo = ttk.Combobox(controls, state="readonly", width=52)
-        self.dose_combo.grid(row=1, column=3, sticky="ew", padx=4)
+        self.dose_combo.grid(row=1, column=3, columnspan=2, sticky="ew", padx=4)
         ttk.Button(
             controls, text="Procurar RTDOSE...", command=self.select_external_dose
-        ).grid(row=1, column=4, padx=4)
+        ).grid(row=1, column=5, padx=4)
 
-        ttk.Label(controls, text="Auto-segmentação (esquerda):").grid(
+        ttk.Label(controls, text="Auto-segmentação:").grid(
             row=2, column=0, sticky="e", padx=4
         )
         self.left_file = ttk.Combobox(controls, state="readonly", width=52)
         self.left_file.grid(row=2, column=1, sticky="ew", padx=4)
-        self.left_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
-        ttk.Label(controls, text="PTV (direita):").grid(row=2, column=2, sticky="e", padx=4)
-        self.right_file = ttk.Combobox(controls, state="readonly", width=52)
-        self.right_file.grid(row=2, column=3, sticky="ew", padx=4)
-        self.right_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
         ttk.Button(
             controls, text="Abrir RTSTRUCT...", command=lambda: self.select_rtstruct_file("left")
-        ).grid(row=2, column=4, padx=4)
+        ).grid(row=2, column=2, padx=4)
+        ttk.Label(controls, text="Referência médica / PTV:").grid(
+            row=2, column=3, sticky="e", padx=4
+        )
+        self.right_file = ttk.Combobox(controls, state="readonly", width=52)
+        self.right_file.grid(row=2, column=4, sticky="ew", padx=4)
         ttk.Button(
             controls, text="Abrir RTSTRUCT...", command=lambda: self.select_rtstruct_file("right")
         ).grid(row=2, column=5, padx=4)
+        self.left_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
+        self.right_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
+        ttk.Label(controls, text="Dose de prescrição (Gy, obrigatória):").grid(
+            row=3, column=0, sticky="e", padx=4
+        )
+        self.prescription_entry = ttk.Entry(
+            controls, textvariable=self.prescription_dose_gy, width=18
+        )
+        self.prescription_entry.grid(row=3, column=1, sticky="w", padx=4)
+        help_button(
+            controls,
+            "Dose de prescrição e cobertura",
+            (
+                "Informe a prescrição em Gy antes de calcular o DVH ou as métricas. "
+                "Vprescrição é o percentual do volume que recebe pelo menos essa dose."
+            ),
+        ).grid(row=3, column=2, sticky="w", padx=4)
 
         selection_controls = ttk.Frame(self.root, padding=(8, 0))
         selection_controls.pack(fill=tk.BOTH, expand=True)
@@ -1474,13 +2023,14 @@ class DvhApplication:
         self.left_rois = ROISelectionPanel(left_selection, on_change=None, height=320)
         self.left_rois.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         right_selection = ttk.LabelFrame(
-            selection_controls, text="PTV: marque as estruturas de referência desejadas"
+            selection_controls,
+            text="Referência médica / PTV: marque as estruturas desejadas",
         )
         right_selection.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=4)
         self.right_rois = ROISelectionPanel(right_selection, on_change=None, height=320)
         self.right_rois.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         controls.columnconfigure(1, weight=1)
-        controls.columnconfigure(3, weight=1)
+        controls.columnconfigure(4, weight=1)
         selection_controls.columnconfigure(0, weight=1, uniform="roi")
         selection_controls.columnconfigure(1, weight=1, uniform="roi")
         selection_controls.rowconfigure(0, weight=1)
@@ -1493,16 +2043,12 @@ class DvhApplication:
         ttk.Button(actions, text="Calcular DVH", command=self.calculate).pack(
             side=tk.LEFT, padx=4, pady=4
         )
-        ttk.Button(actions, text="Tabela de métricas", command=self.calculate_metrics).pack(
+        ttk.Button(
+            actions, text="Resumo dosimétrico", command=self.show_dose_summary
+        ).pack(side=tk.LEFT, padx=4, pady=4)
+        ttk.Button(actions, text="Métricas por estrutura", command=self.calculate_metrics).pack(
             side=tk.LEFT, padx=4, pady=4
         )
-        ttk.Button(actions, text="Exportar DVH (.csv)", command=self.export).pack(
-            side=tk.LEFT, padx=4, pady=4
-        )
-        ttk.Button(actions, text="Salvar gráficos DVH (2 PNG)", command=self.export_plots).pack(
-            side=tk.LEFT, padx=4, pady=4
-        )
-
         status_bar = ttk.Frame(self.root)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 8))
         status_line = ttk.Frame(status_bar)
@@ -1513,18 +2059,15 @@ class DvhApplication:
         self.status.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.percent_label = ttk.Label(status_line, text="0%", width=5, anchor="e")
         self.percent_label.pack(side=tk.RIGHT, padx=(8, 0))
-        self.spinner = ttk.Label(status_line, text="●", width=2, anchor="center")
-        self.spinner.pack(side=tk.RIGHT, padx=(8, 0))
         self.progress = ttk.Progressbar(
             status_bar, mode="determinate", maximum=100, value=0
         )
         self.progress.pack(fill=tk.X, pady=(4, 0))
-        self._spinner_frames = ("◐", "◓", "◑", "◒")
-        self._spinner_after: str | None = None
         self._busy_widgets = [
             widget
             for widget in self._descendants(self.root)
             if widget.winfo_class() in {"TButton", "TCombobox"}
+            or widget.winfo_class() == "TEntry"
             or isinstance(widget, ROISelectionPanel)
         ]
 
@@ -1551,7 +2094,6 @@ class DvhApplication:
                 widget.set_state(tk.DISABLED)
             else:
                 widget.state(["disabled"])
-        self._animate_spinner(0)
         self.root.update_idletasks()
 
         def report_progress(percent: float, detail: str) -> None:
@@ -1567,14 +2109,6 @@ class DvhApplication:
 
         threading.Thread(target=execute, daemon=True).start()
         self.root.after(100, self._poll_task)
-
-    def _animate_spinner(self, frame: int) -> None:
-        if not self._task_active:
-            return
-        self.spinner.configure(text=self._spinner_frames[frame])
-        self._spinner_after = self.root.after(
-            120, self._animate_spinner, (frame + 1) % len(self._spinner_frames)
-        )
 
     def _poll_task(self) -> None:
         while True:
@@ -1593,10 +2127,6 @@ class DvhApplication:
         self.progress.configure(value=100 if error is None else self.progress["value"])
         if error is None:
             self.percent_label.configure(text="100%")
-        if self._spinner_after is not None:
-            self.root.after_cancel(self._spinner_after)
-            self._spinner_after = None
-        self.spinner.configure(text="●")
         self._task_active = False
         for widget in self._busy_widgets:
             if isinstance(widget, ROISelectionPanel):
@@ -1619,11 +2149,86 @@ class DvhApplication:
             raise ValueError("Selecione um arquivo DICOM na lista.")
         return items[index].path
 
+    def _report_selected_patient_ids(self, include_dose: bool = False) -> None:
+        selected = []
+        ct_index = self.ct_combo.current()
+        if 0 <= ct_index < len(self.ct_files):
+            selected.append(("CT", self.ct_files[ct_index]))
+        for label, combo in (
+            ("RTSTRUCT auto-segmentação", self.left_file),
+            ("RTSTRUCT referência médica", self.right_file),
+        ):
+            index = combo.current()
+            if 0 <= index < len(self.rtstruct_files):
+                selected.append((label, self.rtstruct_files[index]))
+        if include_dose:
+            dose_index = self.dose_combo.current()
+            if 0 <= dose_index < len(self.dose_files):
+                selected.append(("RTDOSE", self.dose_files[dose_index]))
+        report_dicom_patient_id_mismatches(selected)
+
+    def _table_headers(self, table: ttk.Treeview) -> list[str]:
+        return [
+            str(table.heading(column, "text"))
+            for column in table["columns"]
+        ]
+
+    @staticmethod
+    def _table_rows(table: ttk.Treeview) -> list[list[str]]:
+        return [
+            [str(value) for value in table.item(item, "values")]
+            for item in table.get_children()
+        ]
+
+    def _save_table_csv(self, table: ttk.Treeview, label: str) -> None:
+        output = filedialog.asksaveasfilename(
+            title=f"Salvar {label} em CSV",
+            initialfile=patient_output_filename(self.patient_id, label, "csv"),
+            defaultextension=".csv",
+            filetypes=[("CSV (separador ;)", "*.csv"), ("Todos os arquivos", "*.*")],
+        )
+        if not output:
+            return
+        output = ensure_patient_output_prefix(output, self.patient_id)
+        try:
+            export_table_csv(
+                self._table_headers(table), self._table_rows(table), output
+            )
+        except OSError as error:
+            messagebox.showerror("Erro ao salvar CSV", str(error))
+            return
+        self.status.configure(text=f"Tabela salva em {output}")
+        messagebox.showinfo("Exportação concluída", f"Arquivo salvo em:\n{output}")
+
+    def _copy_table_to_clipboard(
+        self,
+        window: tk.Toplevel,
+        table: ttk.Treeview,
+        include_header: bool,
+    ) -> None:
+        rows = DvhApplication._table_rows(table)
+        if include_header:
+            rows.insert(0, DvhApplication._table_headers(table))
+        text = "\r\n".join("\t".join(row) for row in rows)
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+        except tk.TclError as error:
+            messagebox.showerror("Erro ao copiar tabela", str(error), parent=window)
+            return
+        messagebox.showinfo(
+            "Cópia concluída",
+            "Tabela copiada com cabeçalho." if include_header
+            else "Tabela copiada sem cabeçalho.",
+            parent=window,
+        )
+
     def _choose_patient_structure(
         self, left_path: Path, right_path: Path
     ) -> tuple[Path, str] | None:
         options = [
-            (right_path, name, "RTSTRUCT do PTV")
+            (right_path, name, "RTSTRUCT de referência médica")
             for name in self.right_rois.get_items()
         ] + [
             (left_path, name, "RTSTRUCT auto-segmentação")
@@ -1646,16 +2251,23 @@ class DvhApplication:
         dialog.title('Escolher substituta para "patient"')
         dialog.transient(self.root)
         dialog.resizable(True, True)
+        chooser_header = ttk.Frame(dialog)
+        chooser_header.pack(fill=tk.X, padx=12, pady=(12, 8))
         ttk.Label(
-            dialog,
-            text=(
-                'A estrutura "patient" não foi encontrada nos RTSTRUCTs selecionados.\n'
-                "Escolha a estrutura que delimita o corpo. Ela será erodida em 0,5 cm "
-                "e usada para limitar as margens do DVH."
-            ),
-            wraplength=560,
+            chooser_header,
+            text='A estrutura "patient" não foi encontrada. Selecione o limite do corpo.',
+            wraplength=500,
             justify=tk.LEFT,
-        ).pack(fill=tk.X, padx=12, pady=(12, 8))
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        help_button(
+            chooser_header,
+            "Limite corporal para margens",
+            (
+                "A estrutura escolhida será erodida em 0,5 cm para limitar as "
+                "expansões apresentadas nos DVHs. Se a ROI patient existir, ela "
+                "é usada automaticamente."
+            ),
+        ).pack(side=tk.RIGHT, padx=(8, 0))
         list_frame = ttk.Frame(dialog)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
         choices = tk.Listbox(list_frame, height=min(16, max(5, len(options))))
@@ -1722,7 +2334,8 @@ class DvhApplication:
         self.ct_series = None
         self.folder_label.configure(text=str(self.folder))
         self._set_combo(self.ct_combo, ct)
-        self._set_combo(self.dose_combo, doses)
+        dose_index = preferred_dose_index(doses)
+        self._set_combo(self.dose_combo, doses, dose_index)
         left_index, right_index = choose_default_rtstructs(structures)
         self._set_combo(self.left_file, structures, left_index)
         self._set_combo(self.right_file, structures, right_index)
@@ -1748,6 +2361,14 @@ class DvhApplication:
         selected = filedialog.askopenfilename(
             title="Selecione um arquivo de dose RTDOSE",
             filetypes=[("Arquivos DICOM", "*.dcm *.dicom"), ("Todos os arquivos", "*.*")],
+            initialdir=str(self.folder) if self.folder else None,
+            initialfile=next(
+                (
+                    item.path.name for item in self.dose_files
+                    if item.path.name.casefold().startswith("dose")
+                ),
+                "",
+            ),
         )
         if not selected:
             return
@@ -1787,6 +2408,18 @@ class DvhApplication:
             title="Selecione o arquivo RTSTRUCT",
             filetypes=[("Arquivos DICOM", "*.dcm *.dicom"), ("Todos os arquivos", "*.*")],
             initialdir=str(self.folder) if self.folder else None,
+            initialfile=(
+                next(
+                    (
+                        item.path.name for item in self.rtstruct_files
+                        if side == "right"
+                        and item.path.name.casefold().startswith("ss")
+                    ),
+                    "",
+                )
+                if side == "right"
+                else ""
+            ),
         )
         if not selected:
             return
@@ -1799,6 +2432,8 @@ class DvhApplication:
                 path,
                 str(getattr(header, "SeriesInstanceUID", "")),
                 str(getattr(header, "SeriesDescription", "")),
+                patient_id=str(getattr(header, "PatientID", "")).strip(),
+                patient_ids=(str(getattr(header, "PatientID", "")).strip(),),
             )
             return item, names
 
@@ -1937,6 +2572,7 @@ class DvhApplication:
                 "Seleção necessária", "Escolha arquivos RTSTRUCT diferentes para comparar."
             )
             return
+        self._report_selected_patient_ids()
         all_left_names = self.left_rois.get_items()
         if not all_left_names:
             messagebox.showwarning(
@@ -2251,6 +2887,25 @@ class DvhApplication:
         )
         self.three_d_canvas.draw_idle()
 
+    def _zoom_3d(self, event) -> None:
+        axes = (self.ax_left_3d, self.ax_right_3d, self.ax_comparison_3d)
+        if event.inaxes not in axes:
+            return
+        factor = 0.8 if event.button == "up" else 1.25
+        for target in axes:
+            if target is None:
+                continue
+            for get_limits, set_limits in (
+                (target.get_xlim3d, target.set_xlim3d),
+                (target.get_ylim3d, target.set_ylim3d),
+                (target.get_zlim3d, target.set_zlim3d),
+            ):
+                lower, upper = get_limits()
+                center = (lower + upper) / 2.0
+                half_range = (upper - lower) * factor / 2.0
+                set_limits(center - half_range, center + half_range)
+        self.three_d_canvas.draw_idle()
+
     def _ensure_3d_window(self) -> None:
         if self.three_d_window is not None and self.three_d_window.winfo_exists():
             self.three_d_window.deiconify()
@@ -2260,6 +2915,13 @@ class DvhApplication:
         self.three_d_window.title("Visualização 3D das estruturas")
         self.three_d_window.geometry("1500x760")
         self.three_d_window.protocol("WM_DELETE_WINDOW", self._close_3d_window)
+        self.three_d_toolbar = ttk.Frame(self.three_d_window, padding=6)
+        self.three_d_toolbar.pack(fill=tk.X)
+        ttk.Button(
+            self.three_d_toolbar,
+            text="Salvar figura 3D (.png)",
+            command=self.export_3d_figure,
+        ).pack(side=tk.LEFT, padx=4)
         self.three_d_figure = Figure(figsize=(16, 7), dpi=110, constrained_layout=True)
         self.ax_left_3d = self.three_d_figure.add_subplot(1, 3, 1, projection="3d")
         self.ax_comparison_3d = self.three_d_figure.add_subplot(1, 3, 2, projection="3d")
@@ -2268,17 +2930,45 @@ class DvhApplication:
             self.three_d_figure, master=self.three_d_window
         )
         self.three_d_canvas.mpl_connect("motion_notify_event", self._sync_3d_views)
+        self.three_d_canvas.mpl_connect("scroll_event", self._zoom_3d)
         self.three_d_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _close_3d_window(self) -> None:
         if self.three_d_window is not None and self.three_d_window.winfo_exists():
             self.three_d_window.destroy()
         self.three_d_window = None
+        self.three_d_toolbar = None
         self.three_d_figure = None
         self.three_d_canvas = None
         self.ax_left_3d = None
         self.ax_right_3d = None
         self.ax_comparison_3d = None
+
+    def export_3d_figure(self) -> None:
+        if self.three_d_figure is None:
+            messagebox.showwarning(
+                "Visualização 3D indisponível",
+                "Abra a visualização 3D antes de salvar a figura.",
+            )
+            return
+        output = filedialog.asksaveasfilename(
+            title="Salvar figura da comparação 3D",
+            initialfile=patient_output_filename(
+                self.patient_id, "comparacao_3d", "png"
+            ),
+            defaultextension=".png",
+            filetypes=[("Imagem PNG", "*.png")],
+        )
+        if not output:
+            return
+        output = ensure_patient_output_prefix(output, self.patient_id)
+        try:
+            self.three_d_figure.savefig(output, dpi=180, format="png")
+        except OSError as error:
+            messagebox.showerror("Erro ao salvar figura 3D", str(error))
+            return
+        self.status.configure(text=f"Figura 3D salva em {output}")
+        messagebox.showinfo("Exportação concluída", f"Figura 3D salva em:\n{output}")
 
     def _ensure_dvh_window(self) -> None:
         if self.dvh_window is not None and self.dvh_window.winfo_exists():
@@ -2289,6 +2979,21 @@ class DvhApplication:
         self.dvh_window.title("Histogramas dose-volume (DVH)")
         self.dvh_window.geometry("1100x800")
         self.dvh_window.protocol("WM_DELETE_WINDOW", self._close_dvh_window)
+        self.dvh_toolbar = ttk.Frame(self.dvh_window, padding=6)
+        self.dvh_toolbar.pack(fill=tk.X)
+        ttk.Button(
+            self.dvh_toolbar,
+            text="Mostrar subestruturas",
+            command=self.show_substructures,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            self.dvh_toolbar, text="Exportar DVH (.csv)", command=self.export
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            self.dvh_toolbar,
+            text="Salvar gráficos DVH (2 PNG)",
+            command=self.export_plots,
+        ).pack(side=tk.LEFT, padx=4)
         self.dvh_figure = Figure(figsize=(11, 8), dpi=110, constrained_layout=True)
         self.ax_percent = self.dvh_figure.add_subplot(2, 1, 1)
         self.ax_cc = self.dvh_figure.add_subplot(2, 1, 2)
@@ -2300,6 +3005,7 @@ class DvhApplication:
         if self.dvh_window is not None and self.dvh_window.winfo_exists():
             self.dvh_window.destroy()
         self.dvh_window = None
+        self.dvh_toolbar = None
         self.dvh_figure = None
         self.dvh_canvas = None
         self.ax_percent = None
@@ -2333,6 +3039,9 @@ class DvhApplication:
 
     def calculate(self) -> None:
         try:
+            prescription_dose = parse_prescription_dose(
+                self.prescription_dose_gy.get()
+            )
             if self.folder is None or self.ct_combo.current() < 0:
                 raise ValueError("Selecione uma série CT.")
             if self.dose_combo.current() < 0:
@@ -2342,7 +3051,7 @@ class DvhApplication:
             right_names = self.right_rois.get_selected()
             if not left_names or not right_names:
                 raise ValueError(
-                    "Selecione uma ou mais estruturas de auto-segmentação e um ou mais PTVs."
+                    "Selecione estruturas auto-segmentadas e estruturas de referência médica."
                 )
             if not (0 <= left_index < len(self.rtstruct_files)) or not (
                 0 <= right_index < len(self.rtstruct_files)
@@ -2352,6 +3061,7 @@ class DvhApplication:
             dose_path = self.dose_files[self.dose_combo.current()].path
             left_path = self.rtstruct_files[left_index].path
             right_path = self.rtstruct_files[right_index].path
+            self._report_selected_patient_ids(include_dose=True)
             patient_reference = self._choose_patient_structure(left_path, right_path)
             if patient_reference is None:
                 return
@@ -2398,22 +3108,179 @@ class DvhApplication:
                 right_union,
                 patient_masks[patient_name],
                 progress=lambda percent, message: report(64 + percent * 0.36, message),
+                manual_masks=right_masks,
+                prescription_dose_gy=prescription_dose,
+            )
+            geometry_rows = summary_geometry_metrics(
+                left_masks, right_masks, ct_series
             )
             report(100, "Atualizando gráficos DVH")
-            return ct_series, curves
+            patient_id = patient_id_from_ct_series(ct_series)
+            return ct_series, curves, geometry_rows, patient_id
 
         def calculated(result):
-            self.ct_series, self.curves = result
+            self.ct_series, self.curves, self.summary_rows, self.patient_id = result
+            self.display_curves = list(self.curves)
+            self._dvh_substructure_names = []
+            self._dvh_context = {
+                "ct_series": self.ct_series,
+                "dose_path": dose_path,
+                "series_uid": series_file.series_uid,
+                "left_path": left_path,
+                "right_path": right_path,
+                "left_names": list(left_names),
+                "right_names": list(right_names),
+                "prescription_dose_gy": prescription_dose,
+            }
             self._draw_dvhs(self.curves)
             self.status.configure(
-                text="DVH concluído: ROIs individuais, união, margens e PTV Original."
+                text=(
+                    "DVH calculado: PTV original, soma automática e margens de 0,5/1,0 cm."
+                )
             )
 
         self._ensure_dvh_window()
         self._start_task("Calculando dose e histogramas DVH...", calculate_dvh, calculated)
 
+    def show_substructures(self) -> None:
+        if not self.curves or self._dvh_context is None:
+            messagebox.showwarning(
+                "DVH não calculado", "Calcule o DVH antes de selecionar subestruturas."
+            )
+            return
+        dialog = tk.Toplevel(self.dvh_window)
+        dialog.title("Subestruturas para sobrepor no DVH")
+        dialog.geometry("620x620")
+        dialog.transient(self.dvh_window)
+        substructure_header = ttk.Frame(dialog)
+        substructure_header.pack(fill=tk.X, padx=10, pady=8)
+        ttk.Label(
+            substructure_header,
+            text="Selecione as estruturas individuais a sobrepor no DVH.",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        help_button(
+            substructure_header,
+            "Ajuda — subestruturas no DVH",
+            (
+                "Marque contornos individuais dos RTSTRUCTs automático e médico "
+                "para calculá-los e sobrepor suas curvas às quatro curvas principais: "
+                "PTV original, união automática e margens automáticas de 0,5 e 1,0 cm."
+            ),
+        ).pack(side=tk.RIGHT, padx=4)
+        selection_frame = ttk.Frame(dialog)
+        selection_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+        selection_canvas = tk.Canvas(selection_frame, highlightthickness=0)
+        selection_scrollbar = ttk.Scrollbar(
+            selection_frame, orient=tk.VERTICAL, command=selection_canvas.yview
+        )
+        selection_canvas.configure(yscrollcommand=selection_scrollbar.set)
+        selection_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        selection_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        selection_content = ttk.Frame(selection_canvas)
+        content_window = selection_canvas.create_window(
+            (0, 0), window=selection_content, anchor="nw"
+        )
+        selection_content.bind(
+            "<Configure>",
+            lambda _event: selection_canvas.configure(
+                scrollregion=selection_canvas.bbox("all")
+            ),
+        )
+        selection_canvas.bind(
+            "<Configure>",
+            lambda event: selection_canvas.itemconfigure(
+                content_window, width=event.width
+            ),
+        )
+        checks: dict[tuple[str, str], tk.BooleanVar] = {}
+        selected_before = set(self._dvh_substructure_names)
+        for side, title in (
+            ("auto", "Subestruturas auto-segmentadas"),
+            ("manual", "Subestruturas médicas"),
+        ):
+            names = self._dvh_context[
+                "left_names" if side == "auto" else "right_names"
+            ]
+            section = ttk.LabelFrame(selection_content, text=title, padding=8)
+            section.pack(fill=tk.X, expand=True, pady=4)
+            for index, name in enumerate(names):
+                key = (side, name)
+                variable = tk.BooleanVar(
+                    value=f"{side}:{name}" in selected_before
+                )
+                checks[key] = variable
+                ttk.Checkbutton(
+                    section, text=name, variable=variable
+                ).grid(row=index // 2, column=index % 2, sticky="w", padx=4, pady=2)
+            section.columnconfigure(0, weight=1)
+            section.columnconfigure(1, weight=1)
+
+        def apply_selection() -> None:
+            selected = [
+                key for key, variable in checks.items() if variable.get()
+            ]
+            dialog.destroy()
+            if not selected:
+                self._dvh_substructure_names = []
+                self.display_curves = list(self.curves)
+                self._draw_dvhs(self.display_curves)
+                return
+
+            def calculate_selected(report):
+                context = self._dvh_context
+                ct_series = context["ct_series"]
+                dose_path = context["dose_path"]
+                dose_grid = load_dose_grid(dose_path)
+                results = []
+                total = len(selected)
+                for index, (side, name) in enumerate(selected, 1):
+                    path_key = "left_path" if side == "auto" else "right_path"
+                    structure_masks = self._cached_structure_masks(
+                        ct_series,
+                        context[path_key],
+                        context["series_uid"],
+                        [name],
+                    )
+                    doses, voxel_volume = sample_dose_on_mask(
+                        structure_masks[name],
+                        ct_series,
+                        dose_grid=dose_grid,
+                    )
+                    source = "Auto" if side == "auto" else "Médica"
+                    results.append(
+                        create_dvh_curve(
+                            f"Subestrutura {source} — {name}",
+                            doses,
+                            voxel_volume,
+                            context["prescription_dose_gy"],
+                        )
+                    )
+                    report(index * 100 / total, f"DVH da subestrutura {source}: {name}")
+                return results
+
+            def show_selected(curves):
+                self._dvh_substructure_names = [
+                    f"{side}:{name}" for side, name in selected
+                ]
+                self.display_curves = [*self.curves, *curves]
+                self._draw_dvhs(self.display_curves)
+                self.status.configure(
+                    text=f"DVH atualizado com {len(curves)} subestrutura(s)."
+                )
+
+            self._start_task(
+                "Calculando DVHs das subestruturas selecionadas...",
+                calculate_selected,
+                show_selected,
+            )
+
+        ttk.Button(
+            dialog, text="Aplicar seleção", command=apply_selection
+        ).pack(side=tk.RIGHT, padx=10, pady=8)
+
     def _draw_dvhs(self, curves: list[DVHCurve]) -> None:
         self._ensure_dvh_window()
+        self.display_curves = list(curves)
         self.ax_percent.clear()
         self.ax_cc.clear()
         self.ax_percent.set(title="DVH — volume percentual", xlabel="Dose (Gy)", ylabel="Volume (%)")
@@ -2454,6 +3321,210 @@ class DvhApplication:
             self._dvh_cursor_lines[axes] = cursor
             self._dvh_cursor_labels[axes] = readout
         self.dvh_canvas.draw_idle()
+
+    def show_dose_summary(self) -> None:
+        if not self.curves:
+            messagebox.showwarning(
+                "DVH não calculado", "Calcule o DVH antes de consultar o resumo."
+            )
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Resumo integrado geométrico e dosimétrico")
+        window.geometry("1700x760")
+        prescription = self.curves[0].coverage_percent is not None
+        summary_header = ttk.Frame(window)
+        summary_header.pack(fill=tk.X, padx=10, pady=8)
+        help_button(
+            summary_header,
+            "Ajuda — resumo dosimétrico",
+            (
+                "A tabela combina parâmetros dosimétricos com métricas geométricas. "
+                "A dose média e máxima e os quantis D98/D95/D50/D2 são calculados "
+                "sobre os voxels válidos do RTDOSE. D95 é a dose recebida por pelo "
+                "menos 95% do volume. Vprescrição é a fração do volume que recebe "
+                "pelo menos a dose de prescrição informada em Gy. As expansões de "
+                "0,5 e 1,0 cm são aplicadas somente à união automática e comparadas "
+                "com a referência médica original, sem expansão."
+                if prescription
+                else (
+                    "A tabela combina parâmetros dosimétricos com métricas geométricas. "
+                    "A dose média e máxima e os quantis D98/D95/D50/D2 são calculados "
+                    "sobre os voxels válidos do RTDOSE. D95 é a dose recebida por pelo "
+                    "menos 95% do volume. Informe a dose de prescrição em Gy para "
+                    "calcular Vprescrição. As expansões de 0,5 e 1,0 cm são aplicadas "
+                    "somente à união automática e comparadas com a referência médica "
+                    "original, sem expansão."
+                )
+            ),
+        ).pack(side=tk.RIGHT)
+        columns = (
+            "patient_id",
+            "structure",
+            "volume_cc",
+            "mean",
+            "max",
+            "d98",
+            "d95",
+            "d50",
+            "d2",
+            "coverage",
+            "dice",
+            "hausdorff",
+            "mean_surface",
+            "auto_volume",
+            "manual_volume",
+            "volume_difference",
+        )
+        table_frame = ttk.Frame(window)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        table = ttk.Treeview(table_frame, columns=columns, show="headings")
+        headings = (
+            ("patient_id", "ID do paciente", 150),
+            ("structure", "Estrutura", 280),
+            ("volume_cc", "Volume (cm³)", 100),
+            ("mean", "Dose média (Gy)", 110),
+            ("max", "Dose máxima (Gy)", 110),
+            ("d98", "D98 (Gy)", 90),
+            ("d95", "D95 (Gy)", 90),
+            ("d50", "D50 (Gy)", 90),
+            ("d2", "D2 (Gy)", 90),
+            ("coverage", "Vprescrição (%)", 120),
+            ("dice", "Dice (%)", 90),
+            ("hausdorff", "Hausdorff (mm)", 120),
+            ("mean_surface", "Distância média (mm)", 150),
+            ("auto_volume", "Volume auto (cm³)", 130),
+            ("manual_volume", "Volume médico (cm³)", 140),
+            ("volume_difference", "Diferença volume (%)", 150),
+        )
+        for column, title, width in headings:
+            table.heading(column, text=title)
+            table.column(
+                column,
+                width=width,
+                anchor="w" if column in {"patient_id", "structure"} else "center",
+            )
+        scrollbar_y = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=table.yview)
+        scrollbar_x = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=table.xview)
+        table.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+        table.grid(row=0, column=0, sticky="nsew")
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        geometry_by_margin = {
+            float(row["margin_mm"]): row for row in self.summary_rows
+        }
+        geometry_by_curve = {
+            "Auto-segmentação — união": geometry_by_margin.get(0.0),
+            "Auto-segmentação — margem 0,5 cm": geometry_by_margin.get(5.0),
+            "Auto-segmentação — margem 1 cm": geometry_by_margin.get(10.0),
+        }
+        for curve in self.curves:
+            volume_cc = float(curve.volume_cc[0]) if len(curve.volume_cc) else 0.0
+            geometry = geometry_by_curve.get(curve.name)
+            if curve.name == "PTV Original":
+                geometry = geometry_by_margin.get(0.0)
+                auto_volume = (
+                    float(geometry["auto_volume_cc"]) if geometry is not None else 0.0
+                )
+                manual_volume = (
+                    float(geometry["manual_volume_cc"])
+                    if geometry is not None
+                    else volume_cc
+                )
+                dice = (
+                    format_brazilian_number(
+                        float(geometry["dice_percent"]), 2
+                    )
+                    if geometry is not None else "—"
+                )
+                hausdorff = (
+                    format_brazilian_number(
+                        float(geometry["hausdorff_mm"]), 2
+                    )
+                    if geometry is not None else "—"
+                )
+                mean_surface = (
+                    format_brazilian_number(
+                        float(geometry["mean_surface_distance_mm"]), 2
+                    )
+                    if geometry is not None else "—"
+                )
+                volume_difference = (
+                    format_brazilian_number(
+                        float(geometry["volume_difference_percent"]), 2
+                    )
+                    if geometry is not None
+                    and np.isfinite(geometry["volume_difference_percent"])
+                    else "—"
+                )
+            elif geometry is not None:
+                auto_volume = float(geometry["auto_volume_cc"])
+                manual_volume = float(geometry["manual_volume_cc"])
+                dice = format_brazilian_number(
+                    float(geometry["dice_percent"]), 2
+                )
+                hausdorff = format_brazilian_number(
+                    float(geometry["hausdorff_mm"]), 2
+                )
+                mean_surface = (
+                    format_brazilian_number(
+                        float(geometry["mean_surface_distance_mm"]), 2
+                    )
+                )
+                volume_difference = (
+                    format_brazilian_number(
+                        float(geometry["volume_difference_percent"]), 2
+                    )
+                    if np.isfinite(geometry["volume_difference_percent"])
+                    else "—"
+                )
+            else:
+                auto_volume = manual_volume = 0.0
+                dice = hausdorff = mean_surface = volume_difference = "—"
+            table.insert(
+                "",
+                tk.END,
+                values=(
+                    self.patient_id,
+                    curve.name,
+                    format_brazilian_number(volume_cc, 3),
+                    format_brazilian_number(curve.mean_dose_gy, 3),
+                    format_brazilian_number(curve.max_dose_gy, 3),
+                    format_brazilian_number(curve.d98_gy, 3),
+                    format_brazilian_number(curve.d95_gy, 3),
+                    format_brazilian_number(curve.d50_gy, 3),
+                    format_brazilian_number(curve.d2_gy, 3),
+                    (
+                        format_brazilian_number(curve.coverage_percent, 2)
+                        if curve.coverage_percent is not None
+                        else "—"
+                    ),
+                    dice,
+                    hausdorff,
+                    mean_surface,
+                    format_brazilian_number(auto_volume, 3),
+                    format_brazilian_number(manual_volume, 3),
+                    volume_difference,
+                ),
+            )
+        table_actions = ttk.Frame(window)
+        table_actions.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(
+            table_actions,
+            text="Salvar CSV",
+            command=lambda: self._save_table_csv(table, "resumo_dosimetrico"),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            table_actions,
+            text="Copiar",
+            command=lambda: self._copy_table_to_clipboard(window, table, True),
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            table_actions,
+            text="Copiar sem cabeçalho",
+            command=lambda: self._copy_table_to_clipboard(window, table, False),
+        ).pack(side=tk.LEFT, padx=6)
 
     def _update_dvh_cursor(self, event) -> None:
         if not self._dvh_plot_lines:
@@ -2507,11 +3578,16 @@ class DvhApplication:
         try:
             if self.folder is None or self.ct_combo.current() < 0:
                 raise ValueError("Selecione uma pasta e uma série CT.")
+            if self.dose_combo.current() < 0:
+                raise ValueError("Selecione um arquivo RTDOSE.")
+            prescription_dose = parse_prescription_dose(
+                self.prescription_dose_gy.get()
+            )
             left_names = self.left_rois.get_selected()
             right_names = self.right_rois.get_selected()
             if not left_names or not right_names:
                 raise ValueError(
-                    "Selecione ao menos uma estrutura auto-segmentada e um ou mais PTVs."
+                    "Selecione estruturas auto-segmentadas e o PTV de referência."
                 )
             left_index, right_index = self.left_file.current(), self.right_file.current()
             if not (0 <= left_index < len(self.rtstruct_files)) or not (
@@ -2519,8 +3595,10 @@ class DvhApplication:
             ):
                 raise ValueError("Selecione os arquivos RTSTRUCT dos dois conjuntos.")
             series_file = self.ct_files[self.ct_combo.current()]
+            dose_path = self.dose_files[self.dose_combo.current()].path
             left_path = self.rtstruct_files[left_index].path
             right_path = self.rtstruct_files[right_index].path
+            self._report_selected_patient_ids(include_dose=True)
         except (ValueError, IndexError) as error:
             messagebox.showerror("Erro ao calcular métricas", str(error))
             return
@@ -2547,70 +3625,138 @@ class DvhApplication:
                 progress=lambda percent, message: report(54 + percent * 0.34, message),
             )
             ptv_union = np.logical_or.reduce(list(right_masks.values()))
-            report(88, "Calculando Dice e inclusão no PTV; margens das estruturas automáticas")
-            rows = structure_comparison_metrics(
+            report(88, "Calculando doses e métricas para estruturas e margens")
+            dose_grid = load_dose_grid(dose_path)
+            ptv_doses, ptv_voxel_volume_cc = sample_dose_on_mask(
+                ptv_union, ct_series, dose_grid=dose_grid
+            )
+            ptv_curve = create_dvh_curve(
+                "PTV médico original",
+                ptv_doses,
+                ptv_voxel_volume_cc,
+                prescription_dose,
+            )
+            rows = structure_evaluation_rows(
                 left_masks,
                 ptv_union,
                 ct_series,
-                progress=lambda percent, message: report(
-                    88 + percent * 0.12, message
-                ),
+                dose_grid,
+                ptv_curve,
+                prescription_dose,
             )
             report(100, "Tabela de métricas pronta")
-            return rows
+            return rows, patient_id_from_ct_series(ct_series)
 
-        def show_metrics(rows):
+        def show_metrics(result):
+            rows, patient_id = result
+            self.patient_id = patient_id
             window = tk.Toplevel(self.root)
-            window.title("Métricas das estruturas auto-segmentadas")
-            window.geometry("1050x560")
-            ttk.Label(
-                window,
-                text=(
-                    "Dentro do PTV = percentual do volume auto-segmentado contido na união "
-                    "dos PTVs selecionados. Nas colunas de margem, a expansão de 0,5/1,0 cm "
-                    "é aplicada individualmente à estrutura auto-segmentada; o valor indica "
-                    "o percentual do PTV coberto por essa expansão. Dice compara as máscaras "
-                    "originais; 100% indica máscaras idênticas."
+            window.title("Métricas por estrutura auto-segmentada")
+            window.geometry("1820x720")
+            header = ttk.Frame(window, padding=8)
+            header.pack(fill=tk.X)
+            ttk.Button(
+                header,
+                text="Salvar CSV",
+                command=lambda: self._save_table_csv(table, "metricas_por_estrutura"),
+            ).pack(side=tk.RIGHT, padx=4)
+            ttk.Button(
+                header,
+                text="Copiar sem cabeçalho",
+                command=lambda: self._copy_table_to_clipboard(window, table, False),
+            ).pack(side=tk.RIGHT, padx=4)
+            ttk.Button(
+                header,
+                text="Copiar",
+                command=lambda: self._copy_table_to_clipboard(window, table, True),
+            ).pack(side=tk.RIGHT, padx=4)
+            help_button(
+                header,
+                "Ajuda — métricas por estrutura",
+                (
+                    "Cada estrutura automática aparece em três linhas: contorno original, "
+                    "contorno + 0,5 cm e contorno + 1,0 cm. A margem é aplicada somente à "
+                    "estrutura automática; o PTV selecionado permanece fixo. 'Dentro da "
+                    "referência' é o percentual do volume da estrutura avaliada contido no "
+                    "PTV. Cada parâmetro dosimétrico é apresentado como razão entre o valor "
+                    "da estrutura avaliada e o valor do PTV médico original: 1,000 indica "
+                    "igualdade com o PTV; valores abaixo ou acima de 1,000 indicam valores "
+                    "menores ou maiores, respectivamente. Isso se aplica à dose média, dose "
+                    "máxima, D98/D95/D50/D2 e Vprescrição. A razão Vprescrição fica "
+                    "indisponível se a cobertura do PTV original for zero."
                 ),
-                wraplength=1000,
-                justify=tk.LEFT,
-            ).pack(fill=tk.X, padx=10, pady=10)
+            ).pack(side=tk.RIGHT, padx=4)
             columns = (
+                "patient_id",
                 "structure",
-                "inside_ptv",
-                "ptv_inside_auto_margin_05",
-                "ptv_inside_auto_margin_10",
-                "dice",
+                "inside_reference",
+                "volume_cc",
+                "mean_dose_ratio",
+                "max_dose_ratio",
+                "d98_ratio",
+                "d95_ratio",
+                "d50_ratio",
+                "d2_ratio",
+                "coverage_ratio",
             )
             table_frame = ttk.Frame(window)
             table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-            table = ttk.Treeview(
-                table_frame, columns=columns, show="headings", selectmode="browse"
-            )
+            table = ttk.Treeview(table_frame, columns=columns, show="headings")
             headings = (
-                ("structure", "Estrutura auto-segmentada", 300),
-                ("inside_ptv", "Dentro do PTV (%)", 160),
-                ("ptv_inside_auto_margin_05", "PTV na margem auto 0,5 cm (%)", 200),
-                ("ptv_inside_auto_margin_10", "PTV na margem auto 1,0 cm (%)", 200),
-                ("dice", "Dice original (%)", 140),
+                ("patient_id", "ID do paciente", 150),
+                ("structure", "Estrutura auto-segmentada", 260),
+                ("inside_reference", "Dentro da referência (%)", 150),
+                ("volume_cc", "Volume (cm³)", 100),
+                ("mean_dose_ratio", "Dose média / PTV", 125),
+                ("max_dose_ratio", "Dose máxima / PTV", 130),
+                ("d98_ratio", "D98 / PTV", 95),
+                ("d95_ratio", "D95 / PTV", 95),
+                ("d50_ratio", "D50 / PTV", 95),
+                ("d2_ratio", "D2 / PTV", 95),
+                ("coverage_ratio", "Vprescrição / PTV", 135),
             )
             for column, title, width in headings:
                 table.heading(column, text=title)
-                table.column(column, width=width, anchor="w" if column == "structure" else "center")
-            scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=table.yview)
-            table.configure(yscrollcommand=scrollbar.set)
-            table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                table.column(
+                    column,
+                    width=width,
+                    anchor="w" if column in {"patient_id", "structure"} else "center",
+                )
+            scrollbar_y = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=table.yview)
+            scrollbar_x = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=table.xview)
+            table.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+            table.grid(row=0, column=0, sticky="nsew")
+            scrollbar_y.grid(row=0, column=1, sticky="ns")
+            scrollbar_x.grid(row=1, column=0, sticky="ew")
+            table_frame.rowconfigure(0, weight=1)
+            table_frame.columnconfigure(0, weight=1)
             for row in rows:
                 table.insert(
                     "",
                     tk.END,
                     values=(
+                        patient_id,
                         row["structure"],
-                        f'{row["inside_ptv_percent"]:.1f}',
-                        f'{row["ptv_inside_auto_margin_05_percent"]:.1f}',
-                        f'{row["ptv_inside_auto_margin_10_percent"]:.1f}',
-                        f'{row["dice_percent"]:.1f}',
+                        format_brazilian_number(
+                            row["inside_reference_percent"], 2
+                        ),
+                        format_brazilian_number(row["volume_cc"], 3),
+                        *(
+                            format_brazilian_number(
+                                row[column], 3
+                            )
+                            if row[column] is not None
+                            else "—"
+                            for column in (
+                                "mean_dose_ratio",
+                                "max_dose_ratio",
+                                "d98_ratio",
+                                "d95_ratio",
+                                "d50_ratio",
+                                "d2_ratio",
+                                "coverage_ratio",
+                            )
+                        ),
                     ),
                 )
             self.status.configure(text="Tabela de métricas exibida.")
@@ -2622,16 +3768,18 @@ class DvhApplication:
         )
 
     def export(self) -> None:
-        if not self.curves:
+        if not self.display_curves:
             messagebox.showwarning("DVH não calculado", "Calcule o DVH antes de exportar.")
             return
         output = filedialog.asksaveasfilename(
             title="Exportar tabela DVH",
+            initialfile=patient_output_filename(self.patient_id, "dvh", "csv"),
             defaultextension=".csv",
             filetypes=[("CSV (separador ;)", "*.csv"), ("Todos os arquivos", "*.*")],
         )
         if not output:
             return
+        output = ensure_patient_output_prefix(output, self.patient_id)
 
         def exported(_result):
             self.status.configure(text=f"Tabela DVH exportada para {output}")
@@ -2639,9 +3787,10 @@ class DvhApplication:
 
         def write_table(report):
             export_dvh_csv(
-                self.curves,
+                self.display_curves,
                 output,
                 progress=lambda percent, message: report(percent, message),
+                patient_id=self.patient_id,
             )
             report(100, "Tabela DVH salva")
 
@@ -2652,16 +3801,18 @@ class DvhApplication:
         )
 
     def export_plots(self) -> None:
-        if not self.curves:
+        if not self.display_curves:
             messagebox.showwarning("DVH não calculado", "Calcule o DVH antes de exportar os gráficos.")
             return
         output = filedialog.asksaveasfilename(
             title="Definir nomes dos gráficos DVH",
+            initialfile=patient_output_filename(self.patient_id, "dvh", "png"),
             defaultextension=".png",
             filetypes=[("Imagem PNG", "*.png")],
         )
         if not output:
             return
+        output = ensure_patient_output_prefix(output, self.patient_id)
 
         def exported(paths):
             self.status.configure(text=f"Gráficos DVH salvos em {paths[0]} e {paths[1]}")
@@ -2672,7 +3823,7 @@ class DvhApplication:
 
         def write_plots(report):
             paths = export_dvh_plots(
-                self.curves,
+                self.display_curves,
                 output,
                 progress=lambda percent, message: report(percent, message),
             )
