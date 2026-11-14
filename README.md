@@ -550,15 +550,24 @@ py -3.12 -m venv .venv-dvh
 1. Na janela, selecione a pasta que contém a série CT, o RTDOSE e os
    RTSTRUCTs. Se estiverem em pastas diferentes, use os botões de seleção
    manual para a dose e para cada RTSTRUCT.
-2. Selecione explicitamente a CT, o RTDOSE, o RTSTRUCT de auto-segmentação e
-   o RTSTRUCT de referência médica. Arquivos RTDOSE cujo nome começa com
-   `DOSE` e RTSTRUCTs cujo nome começa com `SS` são selecionados
-   automaticamente quando encontrados; arquivos com prefixo `TOTAL_` podem
-   ser sugeridos para auto-segmentação.
+2. Selecione explicitamente a CT, o RTDOSE, um ou mais RTSTRUCTs de
+   auto-segmentação e o RTSTRUCT de referência médica. Na lista
+   **Auto-segmentação**, use Ctrl ou Shift para marcar mais de um arquivo;
+   **Abrir RTSTRUCT(s)...** também aceita múltipla seleção. Quando há vários
+   RTSTRUCTs automáticos, o nome de cada estrutura recebe o nome-base do
+   arquivo como sufixo: por exemplo, `L2` de `HD.dcm` aparece como `L2_HD`.
+   Ao escolher a pasta DICOM, o aplicativo também procura até três níveis
+   acima por `0_CT_XIO/<PatientID>/` e, se encontrar, prioriza ali um `DOSE.`
+   e um `SS.` do mesmo paciente. Se não localizar esses arquivos, mantém as
+   seleções encontradas na pasta escolhida. Arquivos com prefixo `TOTAL_`
+   podem ser sugeridos para auto-segmentação.
 3. Confira as listas de ROIs e selecione estruturas correspondentes nos dois
-   RTSTRUCTs. ROIs com `PTV` no nome são pré-selecionadas na referência,
-   quando encontradas. Informe a dose de prescrição em Gy; ela é obrigatória
-   para calcular o DVH e as métricas.
+   RTSTRUCTs. Na auto-segmentação, estruturas chamadas `corpo`, `body` ou
+   `patient` (sem distinção entre maiúsculas/minúsculas) e ROIs de isocentro
+   são excluídas. Na **Referência médica / PTV**, esses nomes continuam
+   disponíveis para seleção. ROIs com `PTV` no nome são pré-selecionadas na
+   referência, quando encontradas. Informe a dose de prescrição em Gy; ela é
+   obrigatória para calcular o DVH e as métricas.
 4. Clique em **Iniciar análise 3D**. Aguarde o processamento das superfícies;
    a janela 3D aparece quando essa etapa terminar.
 5. Avalie a sugestão de ROIs automáticas com pelo menos 60% do volume dentro
@@ -580,6 +589,11 @@ py -3.12 -m venv .venv-dvh
   valores menores ou maiores. Essa tabela não reporta Dice, Hausdorff,
   distância média de superfície nem volumes/diferença volumétrica auto versus
   médico.
+- Ao selecionar mais de um RTSTRUCT automático, as estruturas de todos os
+  arquivos selecionados entram na análise, mantendo seu arquivo de origem no
+  sufixo do nome. O DVH principal usa a união dessas estruturas selecionadas;
+  as máscaras e métricas individuais continuam associadas ao RTSTRUCT de
+  origem correto.
 - **Calcular DVH** calcula somente quatro curvas: PTV original, união das
   estruturas automáticas e essa união expandida em 0,5 e 1,0 cm. O botão
   **Mostrar subestruturas**, dentro da janela DVH, permite selecionar contornos
@@ -631,6 +645,10 @@ O programa combina três objetos DICOM com funções distintas:
   tridimensionais de voxels para fazer as comparações. O conjunto médico
   selecionado é a referência; as ROIs auto-segmentadas selecionadas são
   analisadas individualmente e, em algumas telas, também como uma união.
+  Estruturas sem contornos utilizáveis ou com falha de rasterização são
+  ignoradas individualmente e registradas como aviso no console; as estruturas
+  válidas continuam sendo processadas. Se uma etapa exigir uma estrutura
+  específica e nenhuma selecionada for válida, o aplicativo informa o erro.
 - **RTDOSE (RT Dose Storage):** fornece a matriz de dose, geometria,
   espaçamento, deslocamentos dos planos, `DoseUnits` e `DoseGridScaling`. A
   dose é convertida para Gy (incluindo a conversão de cGy, quando aplicável)

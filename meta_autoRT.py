@@ -417,6 +417,77 @@ def discover_dicom_files(
     return ct_series, doses, structures
 
 
+def discover_xio_reference_files(
+    folder: str | Path, patient_id: str, max_parent_levels: int = 3
+) -> tuple[DicomFile | None, DicomFile | None]:
+    """Best-effort lookup of DOSE./SS. files under 0_CT_XIO/<PatientID>."""
+    patient_id = patient_id.strip()
+    if not patient_id:
+        return None, None
+
+    current = Path(folder)
+    visited_xio_dirs = set()
+    for _level in range(max_parent_levels + 1):
+        xio_dirs = []
+        if current.name.casefold() == "0_ct_xio":
+            xio_dirs.append(current)
+        child_xio = current / "0_CT_XIO"
+        if child_xio.is_dir():
+            xio_dirs.append(child_xio)
+
+        for xio_dir in xio_dirs:
+            normalized = xio_dir.resolve()
+            if normalized in visited_xio_dirs:
+                continue
+            visited_xio_dirs.add(normalized)
+            try:
+                patient_folder = next(
+                    (
+                        child
+                        for child in xio_dir.iterdir()
+                        if child.is_dir()
+                        and child.name.strip().casefold() == patient_id.casefold()
+                    ),
+                    None,
+                )
+            except OSError:
+                continue
+            if patient_folder is None:
+                continue
+
+            _ct, doses, structures = discover_dicom_files(patient_folder)
+
+            def same_patient(item: DicomFile) -> bool:
+                return item.patient_id.strip().casefold() == patient_id.casefold()
+
+            dose = next(
+                (
+                    item
+                    for item in doses
+                    if item.path.name.casefold().startswith("dose.")
+                    and same_patient(item)
+                ),
+                None,
+            )
+            rtstruct = next(
+                (
+                    item
+                    for item in structures
+                    if item.path.name.casefold().startswith("ss.")
+                    and same_patient(item)
+                ),
+                None,
+            )
+            if dose is not None or rtstruct is not None:
+                return dose, rtstruct
+
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None, None
+
+
 def load_ct_series(
     folder: str | Path,
     series_uid: str,
@@ -513,7 +584,11 @@ def load_ct_series(
     )
 
 
-def read_roi_names(rtstruct_path: str | Path, progress=None) -> list[str]:
+def read_roi_names(
+    rtstruct_path: str | Path,
+    progress=None,
+    include_reference_structures: bool = False,
+) -> list[str]:
     if progress:
         progress(5, f"Lendo cabeçalho RTSTRUCT: {Path(rtstruct_path).name}")
     dataset = read_dicom(rtstruct_path, stop_before_pixels=True)
@@ -526,7 +601,10 @@ def read_roi_names(rtstruct_path: str | Path, progress=None) -> list[str]:
         str(getattr(roi, "ROIName", "")).strip()
         for roi in getattr(dataset, "StructureSetROISequence", [])
     ]
-    names = filter_selectable_roi_names([name for name in names if name])
+    names = filter_selectable_roi_names(
+        [name for name in names if name],
+        include_reference_structures=include_reference_structures,
+    )
     if progress:
         progress(100, f"{len(names)} estrutura(s) lida(s) de {Path(rtstruct_path).name}")
     return names
@@ -589,31 +667,80 @@ def load_structure_masks(
     available = set(rtstruct.get_roi_names())
     masks: dict[str, np.ndarray] = {}
     expected_shape = ct_series.shape
+    logger = logging.getLogger(__name__)
     if progress:
         progress(10, f"Rasterizando {len(roi_names)} ROI(s) de {Path(rtstruct_path).name}")
     for index, name in enumerate(roi_names, 1):
         if name not in available:
-            raise ValueError(f"A estrutura '{name}' não foi encontrada no RTSTRUCT.")
+            logger.warning(
+                "Estrutura '%s' não encontrada no RTSTRUCT %s; ignorada.",
+                name,
+                rtstruct_path,
+            )
+            continue
         if name in empty_rois:
             if not allow_empty:
-                raise ValueError(f"A estrutura '{name}' não possui contornos rasterizáveis.")
+                logger.warning(
+                    "Estrutura '%s' sem contornos rasterizáveis em %s; ignorada.",
+                    name,
+                    rtstruct_path,
+                )
+                continue
             masks[name] = np.zeros(expected_shape, dtype=bool)
             continue
         # rt-utils returns (columns, rows, slices); use the CT (rows, columns, slices) convention.
-        mask = np.asarray(rtstruct.get_roi_mask_by_name(name), dtype=bool).transpose(1, 0, 2)
-        if mask.shape != expected_shape:
-            raise ValueError(
-                f"A máscara '{name}' tem dimensão inesperada {mask.shape}; CT: {expected_shape}."
+        try:
+            mask = np.asarray(
+                rtstruct.get_roi_mask_by_name(name), dtype=bool
+            ).transpose(1, 0, 2)
+        except Exception as error:
+            logger.warning(
+                "Falha ao rasterizar a estrutura '%s' em %s; ignorada: %s",
+                name,
+                rtstruct_path,
+                error,
+                exc_info=True,
             )
+            continue
+        if mask.shape != expected_shape:
+            logger.warning(
+                "Máscara da estrutura '%s' em %s tem dimensão inesperada %s "
+                "(CT: %s); ignorada.",
+                name,
+                rtstruct_path,
+                mask.shape,
+                expected_shape,
+            )
+            continue
         if not np.any(mask) and not allow_empty:
-            raise ValueError(f"A estrutura '{name}' não possui contornos rasterizáveis.")
+            logger.warning(
+                "Estrutura '%s' sem voxels rasterizáveis em %s; ignorada.",
+                name,
+                rtstruct_path,
+            )
+            continue
         masks[name] = mask
         if progress:
             progress(
                 10 + index * 90 / max(1, len(roi_names)),
                 f"Rasterizando ROI {index}/{len(roi_names)}: {name}",
             )
+    if progress:
+        progress(100, f"Rasterização concluída: {len(masks)} estrutura(s) válida(s)")
     return masks
+
+
+def _roi_names_by_number(dataset) -> dict[int, str]:
+    logger = logging.getLogger(__name__)
+    roi_names = {}
+    for roi in getattr(dataset, "StructureSetROISequence", []):
+        try:
+            number = int(roi.ROINumber)
+        except (AttributeError, TypeError, ValueError):
+            logger.warning("Definição de ROI sem ROINumber válido; ignorada.")
+            continue
+        roi_names[number] = str(getattr(roi, "ROIName", "")).strip()
+    return roi_names
 
 
 def _repair_contour_image_references(
@@ -636,21 +763,38 @@ def _repair_contour_image_references(
             float(getattr(first, "SliceThickness", ct_series.slice_spacing)) * 0.51,
         )
 
-    roi_numbers = {
-        int(roi.ROINumber): str(getattr(roi, "ROIName", ""))
-        for roi in getattr(dataset, "StructureSetROISequence", [])
-    }
+    roi_numbers = _roi_names_by_number(dataset)
     valid_rois = set()
     for roi_contour in getattr(dataset, "ROIContourSequence", []):
-        roi_name = roi_numbers.get(int(roi_contour.ReferencedROINumber), "")
+        try:
+            referenced_number = int(roi_contour.ReferencedROINumber)
+        except (AttributeError, TypeError, ValueError):
+            logging.getLogger(__name__).warning(
+                "Contorno com ReferencedROINumber inválido; ignorado."
+            )
+            continue
+        roi_name = roi_numbers.get(referenced_number, "")
         if roi_name not in roi_names:
             continue
         valid_contours = []
         for contour in getattr(roi_contour, "ContourSequence", []):
-            contour_points = np.asarray(
-                getattr(contour, "ContourData", []), dtype=float
-            )
-            if contour_points.size < 3 or contour_points.size % 3:
+            try:
+                contour_points = np.asarray(
+                    getattr(contour, "ContourData", []), dtype=float
+                )
+            except (TypeError, ValueError, OverflowError):
+                logging.getLogger(__name__).warning(
+                    "Contorno inválido da ROI '%s'; ignorado.", roi_name
+                )
+                continue
+            if (
+                contour_points.size < 3
+                or contour_points.size % 3
+                or not np.all(np.isfinite(contour_points))
+            ):
+                logging.getLogger(__name__).warning(
+                    "Contorno inválido da ROI '%s'; ignorado.", roi_name
+                )
                 continue
             projection = float(
                 np.mean(contour_points.reshape(-1, 3) @ normal)
@@ -684,16 +828,20 @@ def _sanitize_contours_for_rasterization(
     """Remove malformed or degenerate polygons before rt-utils calls OpenCV fillPoly."""
     from rt_utils import image_helper
 
-    roi_numbers = {
-        int(roi.ROINumber): str(getattr(roi, "ROIName", ""))
-        for roi in getattr(dataset, "StructureSetROISequence", [])
-    }
+    roi_numbers = _roi_names_by_number(dataset)
     transformation = image_helper.get_patient_to_pixel_transformation_matrix(
         ct_series.datasets
     )
     valid_rois = set()
     for roi_contour in getattr(dataset, "ROIContourSequence", []):
-        roi_name = roi_numbers.get(int(roi_contour.ReferencedROINumber), "")
+        try:
+            referenced_number = int(roi_contour.ReferencedROINumber)
+        except (AttributeError, TypeError, ValueError):
+            logging.getLogger(__name__).warning(
+                "Contorno com ReferencedROINumber inválido; ignorado."
+            )
+            continue
+        roi_name = roi_numbers.get(referenced_number, "")
         if roi_name not in roi_names:
             continue
         valid_contours = []
@@ -730,10 +878,21 @@ def _sanitize_contours_for_rasterization(
 def choose_default_rtstructs(files: list[DicomFile]) -> tuple[int, int]:
     auto_index = next(
         (index for index, item in enumerate(files) if item.path.name.upper().startswith("TOTAL_")),
-        0,
+        next(
+            (
+                index
+                for index, item in enumerate(files)
+                if not item.path.name.casefold().startswith("ss")
+            ),
+            0,
+        ),
     )
     ptv_index = next(
-        (index for index, item in enumerate(files) if item.path.name.upper().startswith("SS")),
+        (
+            index
+            for index, item in enumerate(files)
+            if index != auto_index and item.path.name.casefold().startswith("ss")
+        ),
         next((index for index in range(len(files)) if index != auto_index), auto_index),
     )
     return auto_index, ptv_index
@@ -754,8 +913,40 @@ def preferred_ptv_indices(roi_names: list[str]) -> list[int]:
     return [index for index, name in enumerate(roi_names) if "ptv" in name.casefold()]
 
 
-def filter_selectable_roi_names(roi_names: list[str]) -> list[str]:
-    return [name for name in roi_names if "isocenter" not in name.casefold()]
+def filter_selectable_roi_names(
+    roi_names: list[str], include_reference_structures: bool = False
+) -> list[str]:
+    excluded_names = (
+        set()
+        if include_reference_structures
+        else {"corpo", "body", "patient"}
+    )
+    return [
+        name
+        for name in roi_names
+        if "isocenter" not in name.casefold()
+        and name.strip().casefold() not in excluded_names
+    ]
+
+
+def auto_structure_sources(
+    structures_by_file: list[tuple[Path, list[str]]],
+) -> dict[str, tuple[Path, str]]:
+    include_file_suffix = len(structures_by_file) > 1
+    sources: dict[str, tuple[Path, str]] = {}
+    used_names: set[str] = set()
+    for path, names in structures_by_file:
+        suffix = path.stem
+        for name in names:
+            display_name = f"{name}_{suffix}" if include_file_suffix else name
+            unique_name = display_name
+            suffix_index = 2
+            while unique_name.casefold() in used_names:
+                unique_name = f"{display_name}_{suffix_index}"
+                suffix_index += 1
+            used_names.add(unique_name.casefold())
+            sources[unique_name] = (path, name)
+    return sources
 
 
 def contained_structure_candidates(
@@ -1920,6 +2111,7 @@ class DvhApplication:
         self.ct_files: list[DicomFile] = []
         self.dose_files: list[DicomFile] = []
         self.rtstruct_files: list[DicomFile] = []
+        self._left_roi_sources: dict[str, tuple[Path, str]] = {}
         self.ct_series: CTSeries | None = None
         self.curves: list[DVHCurve] = []
         self.display_curves: list[DVHCurve] = []
@@ -1949,13 +2141,12 @@ class DvhApplication:
         self._task_active = False
         self._busy_widgets: list[tk.Widget] = []
         self._mask_cache: OrderedDict[tuple[str, str, str], np.ndarray] = OrderedDict()
-        self._mask_nonempty: dict[tuple[str, str, str], bool] = {}
         self._mask_cache_bytes = 0
         self._surface_cache: OrderedDict[
             tuple[str, str, tuple[str, ...]], tuple[np.ndarray, np.ndarray]
         ] = OrderedDict()
         self._containment_cache: OrderedDict[
-            tuple[str, str, str, tuple[str, ...]], dict[str, float]
+            tuple[tuple[str, ...], str, str, tuple[str, ...]], dict[str, float]
         ] = OrderedDict()
         self.prescription_dose_gy = tk.StringVar(value="")
         self._build_ui()
@@ -1980,14 +2171,36 @@ class DvhApplication:
             controls, text="Procurar RTDOSE...", command=self.select_external_dose
         ).grid(row=1, column=5, padx=4)
 
-        ttk.Label(controls, text="Auto-segmentação:").grid(
+        ttk.Label(controls, text="Auto-segmentação (Ctrl/Shift):").grid(
             row=2, column=0, sticky="e", padx=4
         )
-        self.left_file = ttk.Combobox(controls, state="readonly", width=52)
-        self.left_file.grid(row=2, column=1, sticky="ew", padx=4)
+        left_files_frame = ttk.Frame(controls)
+        left_files_frame.grid(row=2, column=1, sticky="ew", padx=4)
+        self.left_file = tk.Listbox(
+            left_files_frame,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            height=3,
+            width=52,
+        )
+        left_files_scrollbar = ttk.Scrollbar(
+            left_files_frame, orient=tk.VERTICAL, command=self.left_file.yview
+        )
+        self.left_file.configure(yscrollcommand=left_files_scrollbar.set)
+        self.left_file.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left_files_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        auto_file_actions = ttk.Frame(controls)
+        auto_file_actions.grid(row=2, column=2, padx=4)
         ttk.Button(
-            controls, text="Abrir RTSTRUCT...", command=lambda: self.select_rtstruct_file("left")
-        ).grid(row=2, column=2, padx=4)
+            auto_file_actions,
+            text="Abrir RTSTRUCT(s)...",
+            command=lambda: self.select_rtstruct_file("left"),
+        ).pack(fill=tk.X, pady=1)
+        ttk.Button(
+            auto_file_actions,
+            text="Atualizar estruturas",
+            command=self.load_roi_choices,
+        ).pack(fill=tk.X, pady=1)
         ttk.Label(controls, text="Referência médica / PTV:").grid(
             row=2, column=3, sticky="e", padx=4
         )
@@ -1996,7 +2209,9 @@ class DvhApplication:
         ttk.Button(
             controls, text="Abrir RTSTRUCT...", command=lambda: self.select_rtstruct_file("right")
         ).grid(row=2, column=5, padx=4)
-        self.left_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
+        self.left_file.bind(
+            "<<ListboxSelect>>", self._auto_file_selection_changed
+        )
         self.right_file.bind("<<ComboboxSelected>>", lambda _event: self.load_roi_choices())
         ttk.Label(controls, text="Dose de prescrição (Gy, obrigatória):").grid(
             row=3, column=0, sticky="e", padx=4
@@ -2068,6 +2283,7 @@ class DvhApplication:
             for widget in self._descendants(self.root)
             if widget.winfo_class() in {"TButton", "TCombobox"}
             or widget.winfo_class() == "TEntry"
+            or widget.winfo_class() == "Listbox"
             or isinstance(widget, ROISelectionPanel)
         ]
 
@@ -2092,6 +2308,8 @@ class DvhApplication:
         for widget in self._busy_widgets:
             if isinstance(widget, ROISelectionPanel):
                 widget.set_state(tk.DISABLED)
+            elif isinstance(widget, tk.Listbox):
+                widget.configure(state=tk.DISABLED)
             else:
                 widget.state(["disabled"])
         self.root.update_idletasks()
@@ -2131,6 +2349,8 @@ class DvhApplication:
         for widget in self._busy_widgets:
             if isinstance(widget, ROISelectionPanel):
                 widget.set_state(tk.NORMAL)
+            elif isinstance(widget, tk.Listbox):
+                widget.configure(state=tk.NORMAL)
             else:
                 widget.state(["!disabled"])
         if error is not None:
@@ -2149,15 +2369,26 @@ class DvhApplication:
             raise ValueError("Selecione um arquivo DICOM na lista.")
         return items[index].path
 
+    def _auto_file_selection_changed(self, _event=None) -> None:
+        self._left_roi_sources = {}
+        self.left_rois.set_items([])
+        self.status.configure(
+            text=(
+                "Seleção de RTSTRUCT automática alterada. "
+                "Clique em “Atualizar estruturas” para carregar as ROIs."
+            )
+        )
+
     def _report_selected_patient_ids(self, include_dose: bool = False) -> None:
         selected = []
         ct_index = self.ct_combo.current()
         if 0 <= ct_index < len(self.ct_files):
             selected.append(("CT", self.ct_files[ct_index]))
-        for label, combo in (
-            ("RTSTRUCT auto-segmentação", self.left_file),
-            ("RTSTRUCT referência médica", self.right_file),
-        ):
+        selected.extend(
+            ("RTSTRUCT auto-segmentação", item)
+            for item in self._selected_auto_files()
+        )
+        for label, combo in (("RTSTRUCT referência médica", self.right_file),):
             index = combo.current()
             if 0 <= index < len(self.rtstruct_files):
                 selected.append((label, self.rtstruct_files[index]))
@@ -2225,21 +2456,26 @@ class DvhApplication:
         )
 
     def _choose_patient_structure(
-        self, left_path: Path, right_path: Path
+        self, left_sources: dict[str, tuple[Path, str]], right_path: Path
     ) -> tuple[Path, str] | None:
         options = [
-            (right_path, name, "RTSTRUCT de referência médica")
+            (right_path, name, "RTSTRUCT de referência médica", name)
             for name in self.right_rois.get_items()
         ] + [
-            (left_path, name, "RTSTRUCT auto-segmentação")
-            for name in self.left_rois.get_items()
+            (
+                path,
+                display_name,
+                f"RTSTRUCT auto-segmentação ({path.name})",
+                roi_name,
+            )
+            for display_name, (path, roi_name) in left_sources.items()
         ]
         patient_options = [
-            option for option in options if option[1].strip().casefold() == "patient"
+            option for option in options if option[3].strip().casefold() == "patient"
         ]
         if patient_options:
-            path, name, _source = patient_options[0]
-            return path, name
+            path, _display_name, _source, roi_name = patient_options[0]
+            return path, roi_name
         if not options:
             messagebox.showerror(
                 "Estrutura de limite necessária",
@@ -2277,7 +2513,7 @@ class DvhApplication:
         choices.configure(yscrollcommand=scrollbar.set)
         choices.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        for _path, name, source in options:
+        for _path, name, source, _roi_name in options:
             choices.insert(tk.END, f"{source}: {name}")
         result: list[tuple[Path, str] | None] = [None]
 
@@ -2290,8 +2526,8 @@ class DvhApplication:
                     parent=dialog,
                 )
                 return
-            path, name, _source = options[selected[0]]
-            result[0] = (path, name)
+            path, _display_name, _source, roi_name = options[selected[0]]
+            result[0] = (path, roi_name)
             dialog.destroy()
 
         buttons = ttk.Frame(dialog)
@@ -2313,6 +2549,40 @@ class DvhApplication:
         if not selected:
             return
 
+        def inspect_folder(report):
+            ct, doses, structures = discover_dicom_files(selected, progress=report)
+            patient_ids = {
+                patient_id.strip()
+                for item in ct
+                for patient_id in (item.patient_ids or (item.patient_id,))
+                if patient_id.strip()
+            }
+            if len(patient_ids) == 1:
+                patient_id = next(iter(patient_ids))
+                report(95, "Procurando DOSE. e SS. em 0_CT_XIO...")
+                try:
+                    xio_dose, xio_rtstruct = discover_xio_reference_files(
+                        selected, patient_id
+                    )
+                except Exception as error:
+                    logging.getLogger(__name__).warning(
+                        "Não foi possível procurar referências em 0_CT_XIO: %s",
+                        error,
+                        exc_info=True,
+                    )
+                else:
+                    if xio_dose is not None:
+                        doses = [
+                            xio_dose,
+                            *(item for item in doses if item.path != xio_dose.path),
+                        ]
+                    if xio_rtstruct is not None:
+                        structures = [
+                            *(item for item in structures if item.path != xio_rtstruct.path),
+                            xio_rtstruct,
+                        ]
+            return ct, doses, structures
+
         def loaded(result):
             ct, doses, structures = result
             self.folder = Path(selected)
@@ -2321,7 +2591,7 @@ class DvhApplication:
 
         self._start_task(
             "Lendo arquivos DICOM da pasta selecionada...",
-            lambda report: discover_dicom_files(selected, progress=report),
+            inspect_folder,
             loaded,
         )
 
@@ -2337,8 +2607,9 @@ class DvhApplication:
         dose_index = preferred_dose_index(doses)
         self._set_combo(self.dose_combo, doses, dose_index)
         left_index, right_index = choose_default_rtstructs(structures)
-        self._set_combo(self.left_file, structures, left_index)
+        self._set_file_listbox(self.left_file, structures, [left_index] if structures else [])
         self._set_combo(self.right_file, structures, right_index)
+        self._left_roi_sources = {}
         self.left_rois.set_items([])
         self.right_rois.set_items([])
         if doses:
@@ -2404,68 +2675,182 @@ class DvhApplication:
         self.status.configure(text=f"Dose RTDOSE selecionada: {dose.path}")
 
     def select_rtstruct_file(self, side: str) -> None:
-        selected = filedialog.askopenfilename(
-            title="Selecione o arquivo RTSTRUCT",
-            filetypes=[("Arquivos DICOM", "*.dcm *.dicom"), ("Todos os arquivos", "*.*")],
-            initialdir=str(self.folder) if self.folder else None,
-            initialfile=(
-                next(
+        if side == "left":
+            selected = filedialog.askopenfilenames(
+                title="Selecione um ou mais RTSTRUCTs de auto-segmentação",
+                filetypes=[("Arquivos DICOM", "*.dcm *.dicom"), ("Todos os arquivos", "*.*")],
+                initialdir=str(self.folder) if self.folder else None,
+            )
+            selected_paths = [Path(path) for path in selected]
+        else:
+            selected = filedialog.askopenfilename(
+                title="Selecione o arquivo RTSTRUCT",
+                filetypes=[("Arquivos DICOM", "*.dcm *.dicom"), ("Todos os arquivos", "*.*")],
+                initialdir=str(self.folder) if self.folder else None,
+                initialfile=next(
                     (
                         item.path.name for item in self.rtstruct_files
-                        if side == "right"
-                        and item.path.name.casefold().startswith("ss")
+                        if item.path.name.casefold().startswith("ss")
                     ),
                     "",
-                )
-                if side == "right"
-                else ""
-            ),
-        )
-        if not selected:
-            return
-        path = Path(selected)
-
-        def read_structure_file(report):
-            names = read_roi_names(path, progress=report)
-            header = read_dicom(path, stop_before_pixels=True)
-            item = DicomFile(
-                path,
-                str(getattr(header, "SeriesInstanceUID", "")),
-                str(getattr(header, "SeriesDescription", "")),
-                patient_id=str(getattr(header, "PatientID", "")).strip(),
-                patient_ids=(str(getattr(header, "PatientID", "")).strip(),),
+                ),
             )
-            return item, names
+            selected_paths = [Path(selected)] if selected else []
+        if not selected_paths:
+            return
+
+        def read_structure_files(report):
+            results = []
+            for index, path in enumerate(selected_paths):
+                names = read_roi_names(
+                    path,
+                    progress=lambda percent, message, index=index: report(
+                        (index * 100 + percent) / len(selected_paths), message
+                    ),
+                    include_reference_structures=side == "right",
+                )
+                header = read_dicom(path, stop_before_pixels=True)
+                item = DicomFile(
+                    path,
+                    str(getattr(header, "SeriesInstanceUID", "")),
+                    str(getattr(header, "SeriesDescription", "")),
+                    patient_id=str(getattr(header, "PatientID", "")).strip(),
+                    patient_ids=(str(getattr(header, "PatientID", "")).strip(),),
+                )
+                results.append((item, names))
+            return results
 
         self._start_task(
             "Lendo RTSTRUCT e carregando estruturas...",
-            read_structure_file,
-            lambda result: self._add_rtstruct_file(side, *result),
+            read_structure_files,
+            lambda results: self._add_rtstruct_files(side, results),
         )
 
-    def _add_rtstruct_file(self, side: str, item: DicomFile, names: list[str]) -> None:
-        index = next(
-            (
-                position
-                for position, existing in enumerate(self.rtstruct_files)
-                if existing.path == item.path
-            ),
-            None,
+    def _add_rtstruct_files(
+        self,
+        side: str,
+        results: list[tuple[DicomFile, list[str]]],
+    ) -> None:
+        selected_right_index = self.right_file.current()
+        indexes = []
+        for item, _names in results:
+            index = next(
+                (
+                    position
+                    for position, existing in enumerate(self.rtstruct_files)
+                    if existing.path == item.path
+                ),
+                None,
+            )
+            if index is None:
+                self.rtstruct_files.append(item)
+                index = len(self.rtstruct_files) - 1
+            indexes.append(index)
+
+        selected_left_indexes = list(self.left_file.curselection())
+        self._set_file_listbox(
+            self.left_file, self.rtstruct_files, selected_left_indexes
         )
-        if index is None:
-            self.rtstruct_files.append(item)
-            index = len(self.rtstruct_files) - 1
-        combo = self.left_file if side == "left" else self.right_file
-        combo["values"] = [struct.label for struct in self.rtstruct_files]
-        combo.current(index)
-        listbox = self.left_rois if side == "left" else self.right_rois
-        filtered_names = filter_selectable_roi_names(names)
-        selected = (
-            [filtered_names[index] for index in preferred_ptv_indices(filtered_names)]
-            if side == "right"
-            else []
+        self.right_file["values"] = [struct.label for struct in self.rtstruct_files]
+        if 0 <= selected_right_index < len(self.rtstruct_files):
+            self.right_file.current(selected_right_index)
+        if side == "left":
+            self._set_file_listbox(self.left_file, self.rtstruct_files, indexes)
+            self.load_roi_choices()
+            return
+
+        index = indexes[-1]
+        self._set_combo(self.right_file, self.rtstruct_files, index)
+        names = filter_selectable_roi_names(
+            results[-1][1], include_reference_structures=True
         )
-        listbox.set_items(filtered_names, selected)
+        selected = [
+            names[index] for index in preferred_ptv_indices(names)
+        ]
+        self.right_rois.set_items(names, selected)
+        self.load_roi_choices()
+
+    @staticmethod
+    def _set_file_listbox(
+        listbox: tk.Listbox,
+        items: list[DicomFile],
+        selected_indexes: list[int],
+    ) -> None:
+        listbox.delete(0, tk.END)
+        for item in items:
+            listbox.insert(tk.END, item.label)
+        for index in selected_indexes:
+            if 0 <= index < len(items):
+                listbox.selection_set(index)
+        if selected_indexes:
+            listbox.see(selected_indexes[0])
+
+    def _selected_auto_files(self) -> list[DicomFile]:
+        return [
+            self.rtstruct_files[index]
+            for index in self.left_file.curselection()
+            if 0 <= index < len(self.rtstruct_files)
+        ]
+
+    def _selected_auto_sources(
+        self, display_names: list[str] | None = None
+    ) -> dict[str, tuple[Path, str]]:
+        names = display_names if display_names is not None else self.left_rois.get_items()
+        sources = {}
+        for name in names:
+            source = self._left_roi_sources.get(name)
+            if source is not None:
+                sources[name] = source
+        return sources
+
+    def _cached_auto_structure_masks(
+        self,
+        ct_series: CTSeries,
+        series_uid: str,
+        display_names: list[str],
+        allow_empty: bool = False,
+        progress=None,
+        source_map: dict[str, tuple[Path, str]] | None = None,
+        ignore_errors: bool = False,
+    ) -> dict[str, np.ndarray]:
+        sources = (
+            source_map
+            if source_map is not None
+            else self._selected_auto_sources(display_names)
+        )
+        grouped: dict[Path, list[tuple[str, str]]] = {}
+        for display_name in display_names:
+            path, roi_name = sources[display_name]
+            grouped.setdefault(path, []).append((display_name, roi_name))
+
+        result = {}
+        groups = list(grouped.items())
+        for group_index, (path, entries) in enumerate(groups):
+            load_masks = (
+                self._cached_3d_structure_masks
+                if ignore_errors
+                else self._cached_structure_masks
+            )
+            masks = load_masks(
+                ct_series,
+                path,
+                series_uid,
+                [roi_name for _display_name, roi_name in entries],
+                allow_empty=allow_empty,
+                progress=(
+                    lambda percent, message, index=group_index: progress(
+                        (index * 100 + percent) / len(groups), message
+                    )
+                    if progress
+                    else None
+                ),
+            )
+            result.update(
+                (display_name, masks[roi_name])
+                for display_name, roi_name in entries
+                if roi_name in masks
+            )
+        return result
 
     @staticmethod
     def _set_combo(
@@ -2476,62 +2861,67 @@ class DvhApplication:
             combo.current(selected_index)
 
     def load_roi_choices(self) -> None:
-        indexes = (self.left_file.current(), self.right_file.current())
-        paths = [
-            self.rtstruct_files[index].path if 0 <= index < len(self.rtstruct_files) else None
-            for index in indexes
-        ]
+        left_files = self._selected_auto_files()
+        right_index = self.right_file.current()
+        right_path = (
+            self.rtstruct_files[right_index].path
+            if 0 <= right_index < len(self.rtstruct_files)
+            else None
+        )
+        previous_selection = self.left_rois.get_selected()
 
         def read_roi_lists(report):
-            names = []
-            for index, path in enumerate(paths):
-                if path:
-                    names.append(
-                        read_roi_names(
-                            path,
-                            progress=lambda percent, message, index=index: report(
-                                (index * 50) + percent * 0.5, message
-                            ),
-                        )
-                    )
-                else:
-                    names.append([])
-            return [filter_selectable_roi_names(side_names) for side_names in names]
+            structures_by_file = []
+            total_files = len(left_files) + int(right_path is not None)
+            for index, item in enumerate(left_files):
+                names = read_roi_names(
+                    item.path,
+                    progress=lambda percent, message, index=index: report(
+                        (index * 100 + percent) / max(1, total_files), message
+                    ),
+                )
+                structures_by_file.append(
+                    (item.path, filter_selectable_roi_names(names))
+                )
+            right_names = (
+                filter_selectable_roi_names(
+                    read_roi_names(
+                        right_path,
+                        progress=lambda percent, message: report(
+                            (len(left_files) * 100 + percent)
+                            / max(1, total_files),
+                            message,
+                        ),
+                        include_reference_structures=True,
+                    ),
+                    include_reference_structures=True,
+                )
+                if right_path
+                else []
+            )
+            return auto_structure_sources(structures_by_file), right_names
 
         self._start_task(
             "Lendo nomes das estruturas RTSTRUCT...",
             read_roi_lists,
-            self._populate_roi_choices,
+            lambda result: self._populate_roi_choices(result, previous_selection),
         )
 
-    def _populate_roi_choices(self, roi_lists: list[list[str]]) -> None:
-        left_names, right_names = roi_lists
-        self.left_rois.set_items(left_names)
+    def _populate_roi_choices(
+        self,
+        roi_lists: tuple[dict[str, tuple[Path, str]], list[str]],
+        previous_selection: list[str] | None = None,
+    ) -> None:
+        self._left_roi_sources, right_names = roi_lists
+        left_names = list(self._left_roi_sources)
+        preserved_selection = [
+            name for name in previous_selection or [] if name in self._left_roi_sources
+        ]
+        self.left_rois.set_items(left_names, preserved_selection)
         defaults = [
             right_names[index] for index in preferred_ptv_indices(right_names)
         ]
         self.right_rois.set_items(right_names, defaults)
-
-    def _load_inputs(self) -> tuple[CTSeries, Path, Path, Path, list[str], list[str]]:
-        if self.folder is None:
-            raise ValueError("Selecione primeiro uma pasta DICOM.")
-        if self.ct_combo.current() < 0:
-            raise ValueError("Selecione uma série CT.")
-        ct_file = self.ct_files[self.ct_combo.current()]
-        left_path = self._selected_path(self.left_file, self.rtstruct_files)
-        right_path = self._selected_path(self.right_file, self.rtstruct_files)
-        if left_path == right_path:
-            raise ValueError("Selecione dois arquivos RTSTRUCT diferentes para a comparação.")
-        return (
-            load_ct_series(
-                self.folder, ct_file.series_uid, ct_file.instance_paths or None
-            ),
-            self._selected_path(self.dose_combo, self.dose_files),
-            left_path,
-            right_path,
-            self.left_rois.get_selected(),
-            self.right_rois.get_selected(),
-        )
 
     def show_3d(self) -> None:
         self.start_analysis()
@@ -2556,32 +2946,34 @@ class DvhApplication:
                 ),
             )
             return
-        left_index, right_index = self.left_file.current(), self.right_file.current()
-        if not (0 <= left_index < len(self.rtstruct_files)) or not (
-            0 <= right_index < len(self.rtstruct_files)
-        ):
+        left_files = self._selected_auto_files()
+        right_index = self.right_file.current()
+        if not left_files or not (0 <= right_index < len(self.rtstruct_files)):
             messagebox.showwarning(
                 "Seleção necessária", "Selecione os arquivos RTSTRUCT dos dois conjuntos."
             )
             return
         series_file = self.ct_files[self.ct_combo.current()]
-        left_path = self.rtstruct_files[left_index].path
         right_path = self.rtstruct_files[right_index].path
-        if left_path == right_path:
+        left_paths = {item.path for item in left_files}
+        if right_path in left_paths:
             messagebox.showwarning(
-                "Seleção necessária", "Escolha arquivos RTSTRUCT diferentes para comparar."
+                "Seleção necessária",
+                "O RTSTRUCT de referência médica não pode também estar selecionado "
+                "como auto-segmentação.",
             )
             return
         self._report_selected_patient_ids()
-        all_left_names = self.left_rois.get_items()
+        all_left_sources = self._selected_auto_sources()
+        all_left_names = list(all_left_sources)
         if not all_left_names:
             messagebox.showwarning(
                 "Sem estruturas",
-                "O RTSTRUCT da auto-segmentação não contém estruturas selecionáveis.",
+                "Os RTSTRUCTs da auto-segmentação não contêm estruturas selecionáveis.",
             )
             return
         containment_key = (
-            str(left_path),
+            tuple(str(item.path) for item in left_files),
             str(right_path),
             series_file.series_uid,
             tuple(sorted(right_names)),
@@ -2598,20 +2990,26 @@ class DvhApplication:
                 report(95, "Usando resultados de inclusão já calculados")
                 return ct_series, self._containment_cache[containment_key], {}
             report(20, "Rasterizando estruturas candidatas para calcular a inclusão")
-            left_masks = load_structure_masks(
+            left_masks = self._cached_auto_structure_masks(
                 ct_series,
-                left_path,
+                series_file.series_uid,
                 all_left_names,
                 allow_empty=True,
                 progress=lambda percent, message: report(20 + percent * 0.5, message),
+                source_map=all_left_sources,
+                ignore_errors=True,
             )
-            right_masks = self._cached_structure_masks(
+            right_masks = self._cached_3d_structure_masks(
                 ct_series,
                 right_path,
                 series_file.series_uid,
                 right_names,
                 progress=lambda percent, message: report(70 + percent * 0.2, message),
             )
+            if not right_masks:
+                raise ValueError(
+                    "Nenhuma estrutura médica válida possui contornos rasterizáveis."
+                )
             right_union = np.logical_or.reduce(list(right_masks.values()))
             percentages = structure_containment_percentages(left_masks, right_union)
             self._containment_cache[containment_key] = percentages
@@ -2651,16 +3049,6 @@ class DvhApplication:
                     "Nenhuma estrutura correspondente",
                     f"{details}\n\nAs caixas selecionadas manualmente serão mantidas.",
                 )
-            selected_left = self.left_rois.get_selected()
-            self._cache_selected_masks(
-                left_path,
-                series_file.series_uid,
-                {
-                    name: candidate_masks[name]
-                    for name in selected_left
-                    if name in candidate_masks
-                },
-            )
             self._render_selected_3d()
 
         if self.three_d_window is not None and self.three_d_window.winfo_exists():
@@ -2680,25 +3068,20 @@ class DvhApplication:
             if previous is not None:
                 self._mask_cache_bytes -= previous.nbytes
             self._mask_cache[key] = mask
-            self._mask_nonempty[key] = bool(np.any(mask))
             self._mask_cache_bytes += mask.nbytes
         while self._mask_cache_bytes > 512 * 1024 * 1024 and self._mask_cache:
-            old_key, old_mask = self._mask_cache.popitem(last=False)
-            self._mask_nonempty.pop(old_key, None)
+            _old_key, old_mask = self._mask_cache.popitem(last=False)
             self._mask_cache_bytes -= old_mask.nbytes
 
     def _render_selected_3d(self) -> None:
         if self.folder is None or self.ct_combo.current() < 0:
             return
         series_file = self.ct_files[self.ct_combo.current()]
-        left_index, right_index = self.left_file.current(), self.right_file.current()
+        left_files = self._selected_auto_files()
+        right_index = self.right_file.current()
         left_names = self.left_rois.get_selected()
+        left_sources = self._selected_auto_sources(left_names)
         right_names = self.right_rois.get_selected()
-        left_path = (
-            self.rtstruct_files[left_index].path
-            if 0 <= left_index < len(self.rtstruct_files)
-            else None
-        )
         right_path = (
             self.rtstruct_files[right_index].path
             if 0 <= right_index < len(self.rtstruct_files)
@@ -2714,16 +3097,17 @@ class DvhApplication:
                 progress=lambda percent, message: report(percent * 0.18, message),
             )
             all_left_masks = (
-                self._cached_structure_masks(
+                self._cached_auto_structure_masks(
                     ct_series,
-                    left_path,
                     series_file.series_uid,
                     left_names,
                     progress=lambda percent, message: report(
                         18 + percent * 0.36, message
                     ),
+                    source_map=left_sources,
+                    ignore_errors=True,
                 )
-                if left_path is not None and left_names
+                if left_files and left_names
                 else {}
             )
             left_mask = (
@@ -2734,7 +3118,7 @@ class DvhApplication:
                 else None
             )
             right_masks = (
-                self._cached_structure_masks(
+                self._cached_3d_structure_masks(
                     ct_series,
                     right_path,
                     series_file.series_uid,
@@ -2751,7 +3135,11 @@ class DvhApplication:
             )
             surfaces = (
                 self._cached_surface(
-                    left_mask, left_path, series_file.series_uid, left_names, ct_series
+                    left_mask,
+                    tuple(item.path for item in left_files),
+                    series_file.series_uid,
+                    left_names,
+                    ct_series,
                 ),
                 self._cached_surface(
                     right_mask, right_path, series_file.series_uid, right_names, ct_series
@@ -2814,27 +3202,77 @@ class DvhApplication:
         masks = {}
         for name, key in keys.items():
             if name in loaded:
-                masks[name] = loaded[name]
-            else:
+                mask = loaded[name]
+            elif key in self._mask_cache:
                 self._mask_cache.move_to_end(key)
-                masks[name] = self._mask_cache[key]
-            if not allow_empty:
-                nonempty = self._mask_nonempty.get(key)
-                if name in loaded and not cache_results:
-                    nonempty = bool(np.any(masks[name]))
-                if nonempty is None:
-                    nonempty = bool(np.any(masks[name]))
-                    self._mask_nonempty[key] = nonempty
-                if not nonempty:
-                    raise ValueError(
-                        f"A estrutura '{name}' não possui contornos rasterizáveis."
+                mask = self._mask_cache[key]
+            else:
+                continue
+            if not allow_empty and not np.any(mask):
+                logging.getLogger(__name__).warning(
+                    "Estrutura '%s' sem voxels rasterizáveis; ignorada.", name
+                )
+                continue
+            masks[name] = mask
+        return masks
+
+    def _cached_3d_structure_masks(
+        self,
+        ct_series: CTSeries,
+        path: Path,
+        series_uid: str,
+        names: list[str],
+        allow_empty: bool = False,
+        progress=None,
+    ) -> dict[str, np.ndarray]:
+        try:
+            masks = self._cached_structure_masks(
+                ct_series, path, series_uid, names, allow_empty=allow_empty
+            )
+        except Exception as error:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Falha ao carregar o lote de estruturas de %s para a análise 3D; "
+                "tentando cada ROI separadamente: %s",
+                path,
+                error,
+                exc_info=True,
+            )
+            masks = {}
+            for index, name in enumerate(names, 1):
+                try:
+                    individual_masks = self._cached_structure_masks(
+                        ct_series,
+                        path,
+                        series_uid,
+                        [name],
+                        allow_empty=allow_empty,
                     )
+                except Exception as roi_error:
+                    logger.warning(
+                        "Estrutura '%s' de %s ignorada na análise 3D: %s",
+                        name,
+                        path,
+                        roi_error,
+                        exc_info=True,
+                    )
+                    individual_masks = {}
+                if name in individual_masks:
+                    masks[name] = individual_masks[name]
+                if progress:
+                    progress(
+                        index * 100 / max(1, len(names)),
+                        f"Analisando estrutura 3D {index}/{len(names)}: {name}",
+                    )
+            return masks
+        if progress:
+            progress(100, f"Estruturas 3D rasterizadas: {len(masks)} válida(s)")
         return masks
 
     def _cached_surface(
         self,
         mask: np.ndarray | None,
-        path: Path | None,
+        path: Path | tuple[Path, ...] | None,
         series_uid: str,
         names: list[str],
         ct_series: CTSeries,
@@ -2863,7 +3301,7 @@ class DvhApplication:
         masks = load_structure_masks(
             ct_series, rtstruct_path, names if multiple else names[:1]
         )
-        return np.logical_or.reduce(list(masks.values()))
+        return np.logical_or.reduce(list(masks.values())) if masks else None
 
     def _draw_3d(
         self,
@@ -3046,23 +3484,33 @@ class DvhApplication:
                 raise ValueError("Selecione uma série CT.")
             if self.dose_combo.current() < 0:
                 raise ValueError("Selecione um arquivo RTDOSE.")
-            left_index, right_index = self.left_file.current(), self.right_file.current()
+            left_files = self._selected_auto_files()
+            right_index = self.right_file.current()
             left_names = self.left_rois.get_selected()
             right_names = self.right_rois.get_selected()
-            if not left_names or not right_names:
+            if not left_files or not left_names or not right_names:
                 raise ValueError(
                     "Selecione estruturas auto-segmentadas e estruturas de referência médica."
                 )
-            if not (0 <= left_index < len(self.rtstruct_files)) or not (
-                0 <= right_index < len(self.rtstruct_files)
-            ):
+            if not 0 <= right_index < len(self.rtstruct_files):
                 raise ValueError("Selecione os arquivos RTSTRUCT dos dois conjuntos.")
             series_file = self.ct_files[self.ct_combo.current()]
             dose_path = self.dose_files[self.dose_combo.current()].path
-            left_path = self.rtstruct_files[left_index].path
+            left_sources = self._selected_auto_sources(left_names)
+            if len(left_sources) != len(left_names):
+                raise ValueError(
+                    "Atualize a seleção das estruturas auto-segmentadas e tente novamente."
+                )
             right_path = self.rtstruct_files[right_index].path
+            if right_path in {item.path for item in left_files}:
+                raise ValueError(
+                    "O RTSTRUCT de referência médica não pode também estar selecionado "
+                    "como auto-segmentação."
+                )
             self._report_selected_patient_ids(include_dose=True)
-            patient_reference = self._choose_patient_structure(left_path, right_path)
+            patient_reference = self._choose_patient_structure(
+                self._selected_auto_sources(), right_path
+            )
             if patient_reference is None:
                 return
             patient_path, patient_name = patient_reference
@@ -3077,12 +3525,12 @@ class DvhApplication:
                 series_file.instance_paths or None,
                 progress=lambda percent, message: report(percent * 0.18, message),
             )
-            left_masks = self._cached_structure_masks(
+            left_masks = self._cached_auto_structure_masks(
                 ct_series,
-                left_path,
                 series_file.series_uid,
                 left_names,
                 progress=lambda percent, message: report(18 + percent * 0.18, message),
+                source_map=left_sources,
             )
             right_masks = self._cached_structure_masks(
                 ct_series,
@@ -3091,6 +3539,14 @@ class DvhApplication:
                 right_names,
                 progress=lambda percent, message: report(36 + percent * 0.18, message),
             )
+            if not left_masks:
+                raise ValueError(
+                    "Nenhuma estrutura auto-segmentada válida possui contornos rasterizáveis."
+                )
+            if not right_masks:
+                raise ValueError(
+                    "Nenhuma estrutura médica válida possui contornos rasterizáveis."
+                )
             right_union = np.logical_or.reduce(list(right_masks.values()))
             patient_masks = self._cached_structure_masks(
                 ct_series,
@@ -3101,6 +3557,10 @@ class DvhApplication:
                     54 + percent * 0.1, message
                 ),
             )
+            if patient_name not in patient_masks:
+                raise ValueError(
+                    "A estrutura PTV escolhida não possui contornos rasterizáveis."
+                )
             curves, _left_union, _right_mask = compute_dvh_curves(
                 ct_series,
                 dose_path,
@@ -3126,7 +3586,7 @@ class DvhApplication:
                 "ct_series": self.ct_series,
                 "dose_path": dose_path,
                 "series_uid": series_file.series_uid,
-                "left_path": left_path,
+                "left_sources": self._selected_auto_sources(left_names),
                 "right_path": right_path,
                 "left_names": list(left_names),
                 "right_names": list(right_names),
@@ -3232,17 +3692,21 @@ class DvhApplication:
                 dose_path = context["dose_path"]
                 dose_grid = load_dose_grid(dose_path)
                 results = []
+                valid_names = []
                 total = len(selected)
                 for index, (side, name) in enumerate(selected, 1):
-                    path_key = "left_path" if side == "auto" else "right_path"
+                    if side == "auto":
+                        path, roi_name = context["left_sources"][name]
+                    else:
+                        path, roi_name = context["right_path"], name
                     structure_masks = self._cached_structure_masks(
-                        ct_series,
-                        context[path_key],
-                        context["series_uid"],
-                        [name],
+                        ct_series, path, context["series_uid"], [roi_name]
                     )
+                    if roi_name not in structure_masks:
+                        report(index * 100 / total, f"Estrutura inválida ignorada: {name}")
+                        continue
                     doses, voxel_volume = sample_dose_on_mask(
-                        structure_masks[name],
+                        structure_masks[roi_name],
                         ct_series,
                         dose_grid=dose_grid,
                     )
@@ -3255,13 +3719,17 @@ class DvhApplication:
                             context["prescription_dose_gy"],
                         )
                     )
+                    valid_names.append(f"{side}:{name}")
                     report(index * 100 / total, f"DVH da subestrutura {source}: {name}")
-                return results
+                if not results:
+                    raise ValueError(
+                        "Nenhuma das subestruturas selecionadas é válida para calcular DVH."
+                    )
+                return results, valid_names
 
-            def show_selected(curves):
-                self._dvh_substructure_names = [
-                    f"{side}:{name}" for side, name in selected
-                ]
+            def show_selected(result):
+                curves, valid_names = result
+                self._dvh_substructure_names = valid_names
                 self.display_curves = [*self.curves, *curves]
                 self._draw_dvhs(self.display_curves)
                 self.status.configure(
@@ -3589,15 +4057,23 @@ class DvhApplication:
                 raise ValueError(
                     "Selecione estruturas auto-segmentadas e o PTV de referência."
                 )
-            left_index, right_index = self.left_file.current(), self.right_file.current()
-            if not (0 <= left_index < len(self.rtstruct_files)) or not (
-                0 <= right_index < len(self.rtstruct_files)
-            ):
+            left_files = self._selected_auto_files()
+            right_index = self.right_file.current()
+            if not left_files or not 0 <= right_index < len(self.rtstruct_files):
                 raise ValueError("Selecione os arquivos RTSTRUCT dos dois conjuntos.")
             series_file = self.ct_files[self.ct_combo.current()]
             dose_path = self.dose_files[self.dose_combo.current()].path
-            left_path = self.rtstruct_files[left_index].path
+            left_sources = self._selected_auto_sources(left_names)
+            if len(left_sources) != len(left_names):
+                raise ValueError(
+                    "Atualize a seleção das estruturas auto-segmentadas e tente novamente."
+                )
             right_path = self.rtstruct_files[right_index].path
+            if right_path in {item.path for item in left_files}:
+                raise ValueError(
+                    "O RTSTRUCT de referência médica não pode também estar selecionado "
+                    "como auto-segmentação."
+                )
             self._report_selected_patient_ids(include_dose=True)
         except (ValueError, IndexError) as error:
             messagebox.showerror("Erro ao calcular métricas", str(error))
@@ -3610,12 +4086,12 @@ class DvhApplication:
                 series_file.instance_paths or None,
                 progress=lambda percent, message: report(percent * 0.2, message),
             )
-            left_masks = self._cached_structure_masks(
+            left_masks = self._cached_auto_structure_masks(
                 ct_series,
-                left_path,
                 series_file.series_uid,
                 left_names,
                 progress=lambda percent, message: report(20 + percent * 0.34, message),
+                source_map=left_sources,
             )
             right_masks = self._cached_structure_masks(
                 ct_series,
@@ -3624,6 +4100,14 @@ class DvhApplication:
                 right_names,
                 progress=lambda percent, message: report(54 + percent * 0.34, message),
             )
+            if not left_masks:
+                raise ValueError(
+                    "Nenhuma estrutura auto-segmentada válida possui contornos rasterizáveis."
+                )
+            if not right_masks:
+                raise ValueError(
+                    "Nenhuma estrutura médica válida possui contornos rasterizáveis."
+                )
             ptv_union = np.logical_or.reduce(list(right_masks.values()))
             report(88, "Calculando doses e métricas para estruturas e margens")
             dose_grid = load_dose_grid(dose_path)

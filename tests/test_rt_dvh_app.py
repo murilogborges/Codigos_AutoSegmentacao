@@ -4,7 +4,7 @@ from pathlib import Path
 import struct
 import warnings
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pydicom
@@ -59,26 +59,188 @@ class DvhBackendTests(unittest.TestCase):
         self.assertEqual(app.preferred_ptv_indices(["Body", "PTV_high"]), [1])
         self.assertEqual(app.preferred_ptv_indices(["Body"]), [])
 
-    def test_isocenter_rois_are_excluded_case_insensitively(self):
+    def test_auto_structure_names_include_rtstruct_stem_for_multiple_files(self):
+        hd_path = Path("HD.dcm")
+        total_path = Path("TOTAL.dcm")
+
+        sources = app.auto_structure_sources(
+            [(hd_path, ["L2"]), (total_path, ["L2", "L3"])]
+        )
+
+        self.assertEqual(sources["L2_HD"], (hd_path, "L2"))
+        self.assertEqual(sources["L2_TOTAL"], (total_path, "L2"))
+        self.assertEqual(sources["L3_TOTAL"], (total_path, "L3"))
+        self.assertEqual(
+            app.auto_structure_sources([(hd_path, ["L2"])]),
+            {"L2": (hd_path, "L2")},
+        )
+
+    def test_xio_reference_files_are_found_by_patient_id_and_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            patient_folder = Path(temporary) / "0_CT_XIO" / "P123"
+            selected_folder = patient_folder / "Exam" / "CT"
+            selected_folder.mkdir(parents=True)
+            expected_dose = app.DicomFile(
+                patient_folder / "DOSE.1.dcm", "", "", patient_id="P123"
+            )
+            wrong_dose = app.DicomFile(
+                patient_folder / "DOSE.2.dcm", "", "", patient_id="OTHER"
+            )
+            dose_without_dot = app.DicomFile(
+                patient_folder / "DOSE_extra.dcm", "", "", patient_id="P123"
+            )
+            expected_rtstruct = app.DicomFile(
+                patient_folder / "SS.1.dcm", "", "", patient_id="P123"
+            )
+            wrong_rtstruct = app.DicomFile(
+                patient_folder / "SS.2.dcm", "", "", patient_id="OTHER"
+            )
+
+            with patch.object(
+                app,
+                "discover_dicom_files",
+                return_value=(
+                    [],
+                    [wrong_dose, dose_without_dot, expected_dose],
+                    [wrong_rtstruct, expected_rtstruct],
+                ),
+            ) as discover:
+                dose, rtstruct = app.discover_xio_reference_files(
+                    selected_folder, "P123"
+                )
+
+        self.assertEqual(dose, expected_dose)
+        self.assertEqual(rtstruct, expected_rtstruct)
+        discover.assert_called_once_with(patient_folder)
+
+    def test_auto_masks_are_loaded_from_each_source_file_and_keep_display_names(self):
+        hd_path = Path("HD.dcm")
+        total_path = Path("TOTAL.dcm")
+        source_map = app.auto_structure_sources(
+            [(hd_path, ["L2"]), (total_path, ["L2"])]
+        )
+        application = app.DvhApplication.__new__(app.DvhApplication)
+        mask_hd = np.array([True, False])
+        mask_total = np.array([False, True])
+        application._cached_structure_masks = Mock(
+            side_effect=[
+                {"L2": mask_hd},
+                {"L2": mask_total},
+            ]
+        )
+
+        masks = application._cached_auto_structure_masks(
+            object(),
+            "series",
+            ["L2_HD", "L2_TOTAL"],
+            source_map=source_map,
+        )
+
+        self.assertIs(masks["L2_HD"], mask_hd)
+        self.assertIs(masks["L2_TOTAL"], mask_total)
+        self.assertEqual(
+            [call.args[1] for call in application._cached_structure_masks.call_args_list],
+            [hd_path, total_path],
+        )
+
+    def test_mask_cache_omits_invalid_rois_without_missing_key_error(self):
+        application = app.DvhApplication.__new__(app.DvhApplication)
+        application._mask_cache = app.OrderedDict()
+        application._mask_cache_bytes = 0
+        valid_mask = np.ones((2, 2, 2), dtype=bool)
+
+        with patch.object(
+            app, "load_structure_masks", return_value={"valid": valid_mask}
+        ):
+            masks = application._cached_structure_masks(
+                object(),
+                Path("TOTAL_META.dcm"),
+                "1.2.826.0.1.3680043.8.274",
+                ["valid", "spleen"],
+            )
+
+        self.assertEqual(list(masks), ["valid"])
+        self.assertIs(masks["valid"], valid_mask)
+
+    def test_mask_loader_ignores_roi_rasterization_errors(self):
+        frame = SimpleNamespace(FrameOfReferenceUID="frame")
+        dataset = SimpleNamespace(
+            SOPClassUID=str(RTStructureSetStorage),
+            Modality="RTSTRUCT",
+            ReferencedFrameOfReferenceSequence=[frame],
+            StructureSetROISequence=[SimpleNamespace(ROIName="spleen")],
+            ROIContourSequence=[],
+        )
+        ct_series = SimpleNamespace(
+            datasets=[SimpleNamespace(FrameOfReferenceUID="frame")],
+            shape=(1, 1, 1),
+        )
+
+        with (
+            patch.object(app, "read_dicom", return_value=dataset),
+            patch.object(app, "_sanitize_contours_for_rasterization", return_value=set()),
+            patch.object(app, "_repair_contour_image_references", return_value=set()),
+            patch(
+                "rt_utils.rtstruct.RTStruct.get_roi_mask_by_name",
+                side_effect=KeyError("invalid contour"),
+            ),
+            self.assertLogs("meta_autoRT", level="WARNING") as logged,
+        ):
+            masks = app.load_structure_masks(ct_series, Path("TOTAL_META.dcm"), ["spleen"])
+
+        self.assertEqual(masks, {})
+        self.assertTrue(any("spleen" in line for line in logged.output))
+
+    def test_3d_loader_retries_structures_individually_after_batch_error(self):
+        application = app.DvhApplication.__new__(app.DvhApplication)
+        valid_mask = np.ones((2, 2, 2), dtype=bool)
+        application._cached_structure_masks = Mock(
+            side_effect=[
+                RuntimeError("batch failed"),
+                {"valid": valid_mask},
+                RuntimeError("invalid ROI"),
+            ]
+        )
+
+        with self.assertLogs("meta_autoRT", level="WARNING") as logged:
+            masks = application._cached_3d_structure_masks(
+                object(),
+                Path("TOTAL_META.dcm"),
+                "series",
+                ["valid", "spleen"],
+            )
+
+        self.assertEqual(list(masks), ["valid"])
+        self.assertIs(masks["valid"], valid_mask)
+        self.assertTrue(any("spleen" in line for line in logged.output))
+
+    def test_non_analysis_rois_are_excluded_case_insensitively(self):
         names = [
             "PTV",
             "Isocenter",
             "Plan_Isocenter_Point",
             "Body",
             "isocenter reference",
+            "BODY",
+            " patient ",
+            "Corpo",
         ]
 
+        self.assertEqual(app.filter_selectable_roi_names(names), ["PTV"])
         self.assertEqual(
-            app.filter_selectable_roi_names(names), ["PTV", "Body"]
+            app.filter_selectable_roi_names(
+                names, include_reference_structures=True
+            ),
+            ["PTV", "Body", "BODY", " patient ", "Corpo"],
         )
 
-    def test_read_roi_names_hides_isocenter_entries(self):
+    def test_read_roi_names_hides_non_analysis_entries(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "structures.dcm"
             structure = _new_file(path, RTStructureSetStorage, "RTSTRUCT")
             structure.StructureSetROISequence = Sequence()
             for index, name in enumerate(
-                ["PTV_70Gy", "Isocenter", "Body"], start=1
+                ["PTV_70Gy", "Isocenter", "Body", "Patient", "Corpo"], start=1
             ):
                 roi = Dataset()
                 roi.ROINumber = index
@@ -87,8 +249,14 @@ class DvhBackendTests(unittest.TestCase):
             structure.save_as(path, enforce_file_format=True)
 
             names = app.read_roi_names(path)
+            medical_names = app.read_roi_names(
+                path, include_reference_structures=True
+            )
 
-        self.assertEqual(names, ["PTV_70Gy", "Body"])
+        self.assertEqual(names, ["PTV_70Gy"])
+        self.assertEqual(
+            medical_names, ["PTV_70Gy", "Body", "Patient", "Corpo"]
+        )
 
     def test_containment_candidates_use_fraction_of_left_roi_inside_right(self):
         right_mask = np.array([1, 1, 0, 0, 1], dtype=bool)
@@ -1017,6 +1185,14 @@ class DvhBackendTests(unittest.TestCase):
             ct_series = app.load_ct_series(folder, series_uid)
             with self.assertLogs("meta_autoRT", level="WARNING") as logged:
                 masks = app.load_structure_masks(ct_series, structure_path, ["Auto"])
+            with patch(
+                "rt_utils.rtstruct.RTStruct.get_roi_mask_by_name",
+                side_effect=KeyError("invalid contour"),
+            ):
+                with self.assertLogs("meta_autoRT", level="WARNING") as invalid_logged:
+                    invalid_masks = app.load_structure_masks(
+                        ct_series, structure_path, ["Auto"]
+                    )
             structure = pydicom.dcmread(structure_path)
             del structure.ReferencedFrameOfReferenceSequence
             del structure.ROIContourSequence[0].ContourSequence[0].ContourImageSequence
@@ -1029,10 +1205,15 @@ class DvhBackendTests(unittest.TestCase):
                 [structure.ROIContourSequence[0].ContourSequence[1]]
             )
             structure.save_as(structure_path, enforce_file_format=True)
-            with self.assertRaisesRegex(ValueError, "não possui contornos rasterizáveis"):
-                app.load_structure_masks(ct_series, structure_path, ["Auto"])
+            with self.assertLogs("meta_autoRT", level="WARNING"):
+                empty_masks = app.load_structure_masks(
+                    ct_series, structure_path, ["Auto"]
+                )
 
         self.assertEqual(masks["Auto"].shape, (3, 5, 2))
+        self.assertEqual(invalid_masks, {})
+        self.assertTrue(any("Auto" in line for line in invalid_logged.output))
+        self.assertEqual(empty_masks, {})
         self.assertTrue(masks["Auto"][:, :, 0].any())
         self.assertFalse(masks["Auto"][:, :, 1].any())
         self.assertTrue(logged.output)
