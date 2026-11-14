@@ -18,7 +18,7 @@ if [[ "$OUTPUT_FILE" != /* ]]; then
     OUTPUT_FILE="$(pwd)/$OUTPUT_FILE"
 fi
 
-TOTAL_STEPS=10
+TOTAL_STEPS=11
 CURRENT_STEP=0
 PROGRESS_LINE_ACTIVE=0
 SEGMENTATION_LOG="$(mktemp "${TMPDIR:-/tmp}/totalsegmentator-meta.XXXXXX")"
@@ -56,7 +56,7 @@ show_failure_log() {
     fi
 }
 
-for output in TOTAL_META BODY TISSUE HEAD LIVER BRAIN TONGUE OPTICS; do
+for output in TOTAL_META VERTEBRAE_HD BODY TISSUE HEAD LIVER BRAIN TONGUE OPTICS; do
     if [[ -e "$DICOMFolder/$output" ]]; then
         echo "Erro: saída já existe e não será sobrescrita: $DICOMFolder/$output" >&2
         exit 1
@@ -79,7 +79,7 @@ if [[ -e "$DICOMFolder/CORPO.dcm" && ! -s "$DICOMFolder/CORPO.dcm" ]]; then
     echo "Erro: CORPO.dcm existente está vazio e não pode ser reutilizado." >&2
     exit 1
 fi
-for input_stem in TOTAL_META BODY TISSUE HEAD LIVER BRAIN TONGUE OPTICS CORPO; do
+for input_stem in TOTAL_META VERTEBRAE_HD BODY TISSUE HEAD LIVER BRAIN TONGUE OPTICS CORPO; do
     if [[ "$OUTPUT_FILE" == "$DICOMFolder/$input_stem.dcm" ]]; then
         echo "Erro: o RTSTRUCT final não pode sobrescrever uma entrada do fluxo: $OUTPUT_FILE" >&2
         exit 2
@@ -120,6 +120,7 @@ run_segmentation() {
 rtstruct_inputs=()
 for module in \
     "TOTAL_META total" \
+    "VERTEBRAE_HD vertebrae_pp_refined" \
     "BODY body" \
     "TISSUE tissue_4_types" \
     "HEAD head_glands_cavities" \
@@ -131,12 +132,19 @@ do
         continue
     fi
     if run_segmentation "$output_name" "$task" -ho -bs; then
-        if [[ "$output_name" != "TISSUE" && "$output_name" != "BODY" ]]; then
+        if [[ "$output_name" != "TISSUE" \
+           && "$output_name" != "BODY" \
+           && "$output_name" != "VERTEBRAE_HD" ]]; then
             rtstruct_inputs+=("$DICOMFolder/$output_name.dcm")
         fi
     elif [[ "$output_name" == "BODY" ]]; then
         progress_step "Segmentação $task"
         echo "Erro: não foi possível gerar o arquivo final porque a segmentação 'body' falhou; verifique TotalSegmentator." >&2
+        show_failure_log
+        exit 1
+    elif [[ "$output_name" == "VERTEBRAE_HD" ]]; then
+        progress_step "Segmentação $task"
+        echo "Erro: não foi possível gerar VERTEBRAE_HD.dcm com a tarefa 'vertebrae_pp_refined'; verifique TotalSegmentator." >&2
         show_failure_log
         exit 1
     fi

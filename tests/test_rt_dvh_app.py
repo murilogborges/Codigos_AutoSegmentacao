@@ -19,7 +19,7 @@ from pydicom.uid import (
     generate_uid,
 )
 
-import avaliacao_auto_segmentacao_rt as app
+import meta_autoRT as app
 
 
 def _new_file(path, sop_class, modality):
@@ -266,7 +266,7 @@ class DvhBackendTests(unittest.TestCase):
 
             with warnings.catch_warnings(record=True) as captured:
                 warnings.simplefilter("always")
-                with self.assertLogs("avaliacao_auto_segmentacao_rt", level="INFO"):
+                with self.assertLogs("meta_autoRT", level="INFO"):
                     result = app.read_dicom(path)
 
         self.assertEqual(result.file_meta.TransferSyntaxUID, ImplicitVRLittleEndian)
@@ -1015,7 +1015,7 @@ class DvhBackendTests(unittest.TestCase):
             structure.save_as(structure_path, enforce_file_format=True)
 
             ct_series = app.load_ct_series(folder, series_uid)
-            with self.assertLogs("avaliacao_auto_segmentacao_rt", level="WARNING") as logged:
+            with self.assertLogs("meta_autoRT", level="WARNING") as logged:
                 masks = app.load_structure_masks(ct_series, structure_path, ["Auto"])
             structure = pydicom.dcmread(structure_path)
             del structure.ReferencedFrameOfReferenceSequence

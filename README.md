@@ -3,7 +3,7 @@
 Este repositório reúne três ferramentas: processamento automático com
 TotalSegmentator (`Process_DICOMFolder.sh`), cálculo do escore de Agatston e
 análise opcional de dose em `CAC.py`, e avaliação geométrica/dosimétrica de
-RTSTRUCTs em `avaliacao_auto_segmentacao_rt.py`.
+RTSTRUCTs em `meta_autoRT.py`.
 
 > **Atenção:** os resultados são auxiliares e não substituem a revisão das
 > imagens e estruturas por profissionais qualificados. Não use os resultados
@@ -55,7 +55,9 @@ py -3.12 -m venv .venv-cac
 
 O `reportlab` e o `pillow` habilitam a exportação de relatórios PDF com imagens.
 Sem eles, o cálculo pode ser usado, mas a exportação PDF não estará disponível.
-Para executar `avaliacao_auto_segmentacao_rt.py` no Windows, use o procedimento da seção 7.1.
+Para executar `meta_autoRT.py` no Windows, siga também a instalação específica
+da seção 7. A instalação geral do Ubuntu/WSL acima já inclui os pacotes
+necessários ao aplicativo.
 
 ## 2. O que cada ferramenta faz
 
@@ -63,7 +65,7 @@ Para executar `avaliacao_auto_segmentacao_rt.py` no Windows, use o procedimento 
 |---|---|---|
 | `Process_DICOMFolder.sh` | Executa as segmentações MAMA, META ou PELVE e consolida RTSTRUCTs. | Ubuntu ou WSL |
 | `CAC.py` | Calcula escore de Agatston em ROIs cardíacas e, opcionalmente, métricas de RTDOSE. | Windows, Ubuntu ou WSL com interface gráfica |
-| `avaliacao_auto_segmentacao_rt.py` | Avalia contornos auto/médicos por geometria e dose, exibe comparação 3D e DVHs. | Windows, Ubuntu ou WSL com interface gráfica |
+| `meta_autoRT.py` | Avalia contornos auto/médicos por geometria e dose, exibe comparação 3D e DVHs. | Windows, Ubuntu ou WSL com interface gráfica |
 
 As ferramentas têm dependências e entradas diferentes. Instale somente o que
 for usar, mas não misture arquivos de pacientes, aquisições ou referências
@@ -80,7 +82,7 @@ cd Codigos_AutoSegmentacao
 ```
 
 Se o repositório já estiver no computador, apenas abra o terminal na pasta que
-contém `Process_DICOMFolder.sh`, `CAC.py` e `avaliacao_auto_segmentacao_rt.py`. No Windows, abra o
+contém `Process_DICOMFolder.sh`, `CAC.py` e `meta_autoRT.py`. No Windows, abra o
 Ubuntu/WSL para executar os scripts Bash; a unidade `C:` costuma estar
 disponível no WSL em `/mnt/c/`, e outras unidades aparecem sob `/mnt/` conforme
 a configuração local.
@@ -405,9 +407,12 @@ entra no arquivo final.
 
 **META**
 
-1. As tarefas `total`, `body`, `tissue_4_types`, `head_glands_cavities` e
-   `liver_lesions` produzem `TOTAL_META.dcm`, `BODY.dcm`, `TISSUE.dcm`,
-   `HEAD.dcm` e `LIVER.dcm`.
+1. As tarefas `total`, `vertebrae_pp_refined`, `body`, `tissue_4_types`,
+   `head_glands_cavities` e `liver_lesions` produzem, respectivamente,
+   `TOTAL_META.dcm`, `VERTEBRAE_HD.dcm`, `BODY.dcm`, `TISSUE.dcm`, `HEAD.dcm`
+   e `LIVER.dcm`. `VERTEBRAE_HD.dcm` é um RTSTRUCT intermediário independente:
+   ele é gerado e mantido na pasta, mas não é incluído em `GrupoMETA.dcm` nem
+   em `GrupoPELVE.dcm`.
 2. O programa verifica se `TOTAL_META.dcm` contém a ROI chamada exatamente
    `brain`. Se contiver, tenta também `brain_structures`, `head_muscles` e
    `oculomotor_muscles`, que geram `BRAIN.dcm`, `TONGUE.dcm` e `OPTICS.dcm`.
@@ -434,8 +439,8 @@ nome do arquivo final: `GrupoPELVE.dcm`.
   como conflito, não como resultado válido.
 - Se uma tarefa opcional falhar ou não produzir o `.dcm` esperado, o pipeline
   tenta as demais e remove os arquivos parciais daquela tarefa. A criação do
-  corpo e a consolidação são obrigatórias; falhas nessas etapas interrompem o
-  fluxo e exibem diagnóstico.
+  `VERTEBRAE_HD.dcm`, do corpo e a consolidação são obrigatórias; falhas nessas
+  etapas interrompem o fluxo e exibem diagnóstico.
 - Para começar uma nova execução limpa, prefira criar uma nova pasta de
   trabalho. Se for necessário arquivar ou mover saídas antigas, confira cada
   arquivo antes; não apague a pasta de entrada indiscriminadamente.
@@ -513,15 +518,18 @@ A exportação de PDF inclui a tabela, a explicação dos fatores do escore e,
 para estruturas com escore maior que zero, recortes CT com calcificações
 destacadas. Instale `reportlab` e `pillow` para habilitar a criação de PDF.
 
-## 7. Avaliação geométrica, 3D e dosimétrica com `avaliacao_auto_segmentacao_rt.py`
+## 7. Avaliação geométrica, 3D e dosimétrica com `meta_autoRT.py`
 
 O aplicativo compara estruturas auto-segmentadas e contornos de referência
 médica, calcula métricas geométricas e dose-volume e exibe uma comparação 3D.
-Instale as dependências listadas no repositório:
+As dependências Python do aplicativo são `matplotlib`, `numpy`, `pydicom`,
+`rt-utils`, `scipy` e `scikit-image`. No Ubuntu/WSL, elas já estão incluídas no
+comando de instalação geral da seção 1.1. Para instalar somente o aplicativo
+em um ambiente virtual Linux:
 
 ```bash
-python3 -m pip install -r requirements-dvh.txt
-python3 avaliacao_auto_segmentacao_rt.py
+python3 -m pip install matplotlib numpy pydicom rt-utils scipy scikit-image
+python3 meta_autoRT.py
 ```
 
 Use Python 3.10 ou superior. A instalação feita na seção 1 já inclui essas
@@ -533,8 +541,8 @@ No Windows, crie um ambiente virtual próprio no PowerShell e execute:
 ```powershell
 py -3.12 -m venv .venv-dvh
 & ".\.venv-dvh\Scripts\python.exe" -m pip install --upgrade pip
-& ".\.venv-dvh\Scripts\python.exe" -m pip install -r requirements-dvh.txt
-& ".\.venv-dvh\Scripts\python.exe" avaliacao_auto_segmentacao_rt.py
+& ".\.venv-dvh\Scripts\python.exe" -m pip install matplotlib numpy pydicom rt-utils scipy scikit-image
+& ".\.venv-dvh\Scripts\python.exe" meta_autoRT.py
 ```
 
 ### 7.1. Preparar a análise
@@ -610,6 +618,76 @@ avisos; o programa pode tentar a associação pelas coordenadas físicas, mas
 isso não equivale a registro. Séries CT com espaçamento irregular e dose sem
 cobertura dos pontos necessários não devem ser interpretadas como se fossem
 válidas.
+
+### 7.3. Como os dados são obtidos e o que significam
+
+O programa combina três objetos DICOM com funções distintas:
+
+- **CT (CT Image Storage):** fornece a grade de imagem, a posição e orientação
+  dos cortes, o espaçamento entre pixels/cortes, `PatientID` e
+  `FrameOfReferenceUID`. As métricas volumétricas são computadas na grade CT.
+- **RTSTRUCT (RT Structure Set Storage):** fornece ROIs e seus contornos
+  físicos. O aplicativo rasteriza os contornos selecionados em máscaras
+  tridimensionais de voxels para fazer as comparações. O conjunto médico
+  selecionado é a referência; as ROIs auto-segmentadas selecionadas são
+  analisadas individualmente e, em algumas telas, também como uma união.
+- **RTDOSE (RT Dose Storage):** fornece a matriz de dose, geometria,
+  espaçamento, deslocamentos dos planos, `DoseUnits` e `DoseGridScaling`. A
+  dose é convertida para Gy (incluindo a conversão de cGy, quando aplicável)
+  e amostrada nos centros dos voxels da CT por interpolação trilinear. Voxels
+  fora da cobertura espacial válida da dose não entram nos cálculos; se nenhum
+  voxel da estrutura tiver dose válida, a análise é interrompida com erro.
+
+**Métricas geométricas e de volume**
+
+- **Volume (cm³):** número de voxels da máscara multiplicado pelo volume de
+  voxel, `espaçamento entre linhas × espaçamento entre colunas × espaçamento
+  entre cortes / 1000`. Os espaçamentos estão em milímetros.
+- **Dentro da referência (%):** `100 × voxels da estrutura avaliada dentro do
+  PTV / voxels da estrutura avaliada`. A referência permanece fixa; somente a
+  estrutura automática é expandida em 5 mm ou 10 mm para as linhas com margem.
+- **Dice (%):** `200 × interseção / (volume da máscara automática + volume da
+  máscara médica)`. É 100% para máscaras idênticas e 0% quando não há
+  interseção. As distâncias de superfície são calculadas entre voxels de
+  borda, em coordenadas físicas considerando o espaçamento CT.
+- **Hausdorff (mm):** maior distância entre uma borda e o ponto mais próximo
+  da outra borda, considerando ambas as direções. É sensível a um ponto
+  discrepante extremo.
+- **Distância média de superfície (mm):** média conjunta das distâncias de
+  cada voxel de borda até o ponto mais próximo na borda oposta. Diferente de
+  Hausdorff, resume a discrepância global, sem representar o maior erro.
+- **Diferença de volume (%):** `100 × (volume automático − volume médico) /
+  volume médico`. O sinal indica se o automático é maior ou menor; não é uma
+  medida de sobreposição.
+- **Margens:** expansões isotrópicas de 5 mm (0,5 cm) ou 10 mm (1,0 cm),
+  calculadas por distância euclidiana física usando os espaçamentos da CT.
+  Nas comparações por estrutura e na tabela-resumo, a margem é aplicada ao
+  automático, não ao PTV de referência.
+
+**Métricas dosimétricas**
+
+- **DVH cumulativo:** para cada nível de dose, representa o volume absoluto
+  (cm³) ou relativo (%) que recebe pelo menos aquele nível. A curva é
+  construída a partir das doses válidas amostradas nos voxels da máscara, em
+  intervalos de 0,1 Gy.
+- **Dose média e máxima (Gy):** média aritmética e maior dose amostrada nos
+  voxels válidos da estrutura.
+- **D98, D95, D50 e D2 (Gy):** doses recebidas por pelo menos 98%, 95%, 50% e
+  2% do volume, respectivamente. São obtidas como os percentis inferiores
+  correspondentes da distribuição de doses (p2, p5, p50 e p98).
+- **Vprescrição (%):** `100 × voxels com dose ≥ dose de prescrição / voxels
+  com dose válida`. A prescrição em Gy é obrigatória para iniciar o cálculo.
+- **Razões por estrutura:** na tabela “Métricas por estrutura”, cada dose
+  média, dose máxima, D98/D95/D50/D2 e Vprescrição da ROI automática (incluindo
+  suas margens) é dividida pelo valor da mesma métrica no PTV médico original.
+  Razão 1,000 significa igualdade com o PTV. Para Vprescrição, se o PTV tiver
+  cobertura zero, a razão não é definida e aparece como “—”.
+
+Os valores de dose descrevem as amostras RTDOSE disponíveis e a interpolação
+na grade CT; não equivalem a uma validação independente do plano de tratamento.
+O programa verifica os `PatientID` e informa divergências, mas essa verificação
+não substitui a conferência de paciente, estudo, `FrameOfReferenceUID`,
+registro espacial ou integridade dos arquivos pelo usuário.
 
 ## 8. Testes do projeto
 
